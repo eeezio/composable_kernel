@@ -182,7 +182,7 @@ struct impl::ext_vector<pk_fp6x16_t, 1>
 {
     static constexpr index_t N = 1;
     using value_type           = int32x3_tt;
-    using type                 = int32x3_tt; // this is danguous
+    using type                 = int32x3_tt;
 };
 
 template <>
@@ -190,7 +190,7 @@ struct impl::ext_vector<pk_fp6x16_t, 2>
 {
     static constexpr index_t N = 2;
     using value_type           = int32x6_tt;
-    using type                 = int32x6_tt; // this is danguous
+    using type                 = int32x6_tt;
 };
 
 // u32
