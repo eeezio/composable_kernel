@@ -113,6 +113,58 @@ __global__ void kernel1(const T* attn_weights,
     }
 }
 
+template <typename T, typename mask_type, typename shape_config, bool dropout_mask, bool mask>
+__global__ void kernel2(const T* attn_weights,
+                        const T* dropout_mask,
+                        const mask_type* mask_matrix,
+                        T* grad_attn,
+                        T dropout_scale)
+{
+    const uint32_t block_id        = blockIdx.x;
+    const uint32_t thread_id       = threadIdx.x;
+    constexpr int seq_q            = shape_config::seq_q;
+    constexpr int seq_kv           = shape_config::seq_kv;
+    constexpr int bs_num_per_block = blockDim.x;
+    static_assert(bs_num_per_block / (seq_kv * seq_kv) > 0 &&
+                      bs_num_per_block % (seq_q * seq_kv) == 0,
+                  "wrong!");
+    const uint32_t cur_block_offset = block_id * bs_num_per_block + thread_id;
+    __shared__ T tmp_grad_score[bs_num_per_block];
+    constexpr int reduce_score_num = bs_num_per_block / seq_kv;
+    __shared__ T reduce_grad_scorep[reduce_score_num];
+    constexpr loop_num = bs_num_per_block / (seq_q * seq_kv);
+
+    T grad_attn_value = grad_attn[cur_block_offset];
+    if constexpr(dropout_mask)
+    {
+        grad_attn_value = grad_attn_value * dropout_mask[cur_block_offset] * dropout_scale;
+    }
+    T attn_weight = attn_weights[cur_block_offset];
+    T grad_score  = grad_attn_value * attn_weight;
+    if constexpr(mask)
+    {
+        mask_type cur_thread_mask = mask_matrix[cur_block_offset];
+        if(cur_thread_mask)
+            grad_score = T(0.0f);
+    }
+    tmp_grad_score[thread_id] = grad_score;
+    __syncthreads();
+    // reduce within block
+    if(thread_id < reduce_score_num)
+    {
+        T sum = T(0.0f);
+#pragma unroll
+        for(int i = 0; i < seq_kv; i++)
+        {
+            sum += tmp_grad_score[thread_id * seq_kv + i];
+        }
+        reduce_grad_scorep[thread_id] = sum;
+    }
+    __syncthreads();
+    grad_score -= attn_weight * reduce_grad_scorep[thread_id / seq_kv];
+    grad_attn[cur_block_offset] = grad_score;
+}
+
 // Helper function: Matrix multiplication C = A @ B
 // A: [rows_a, cols_a], B: [cols_a, cols_b], C: [rows_a, cols_b]
 void matmul(const hip_bfloat16* A,
