@@ -36,6 +36,15 @@ struct fmha_kernel_config
     static constexpr int head_dim = HEAD_DIM;
 };
 
+template <int step2_block_size_ = 256, bool enable_dropout_mask_ = true, bool enable_mask_ = true>
+struct fmha_kernel_parallel_policy
+{
+
+    static constexpr int step2_block_size     = step2_block_size_;
+    static constexpr bool enable_dropout_mask = enable_dropout_mask_;
+    static constexpr bool enable_mask         = enable_mask_;
+};
+
 template <typename T, typename shape_config>
 __global__ void kernel1(const T* attn_weights,
                         const T* grad_O,
@@ -113,18 +122,18 @@ __global__ void kernel1(const T* attn_weights,
     }
 }
 
-template <typename T, typename mask_type, typename shape_config, bool dropout_mask, bool mask>
+template <typename T, typename mask_type, typename shape_config, typename parallel_policy>
 __global__ void kernel2(const T* attn_weights,
                         const T* dropout_mask,
-                        const mask_type* mask_matrix,
+                        const mask_type* mask,
                         T* grad_attn,
-                        T dropout_scale)
+                        float dropout_scale)
 {
     const uint32_t block_id        = blockIdx.x;
     const uint32_t thread_id       = threadIdx.x;
     constexpr int seq_q            = shape_config::seq_q;
     constexpr int seq_kv           = shape_config::seq_kv;
-    constexpr int bs_num_per_block = blockDim.x;
+    constexpr int bs_num_per_block = parallel_policy::step2_block_size;
     static_assert(bs_num_per_block / (seq_kv * seq_kv) > 0 &&
                       bs_num_per_block % (seq_q * seq_kv) == 0,
                   "wrong!");
@@ -132,18 +141,18 @@ __global__ void kernel2(const T* attn_weights,
     __shared__ T tmp_grad_score[bs_num_per_block];
     constexpr int reduce_score_num = bs_num_per_block / seq_kv;
     __shared__ T reduce_grad_scorep[reduce_score_num];
-    constexpr loop_num = bs_num_per_block / (seq_q * seq_kv);
+    constexpr int loop_num = bs_num_per_block / (seq_q * seq_kv);
 
     T grad_attn_value = grad_attn[cur_block_offset];
-    if constexpr(dropout_mask)
+    if constexpr(parallel_policy::enable_dropout_mask)
     {
         grad_attn_value = grad_attn_value * dropout_mask[cur_block_offset] * dropout_scale;
     }
     T attn_weight = attn_weights[cur_block_offset];
     T grad_score  = grad_attn_value * attn_weight;
-    if constexpr(mask)
+    if constexpr(parallel_policy::enable_mask)
     {
-        mask_type cur_thread_mask = mask_matrix[cur_block_offset];
+        mask_type cur_thread_mask = mask[cur_block_offset];
         if(cur_thread_mask)
             grad_score = T(0.0f);
     }
@@ -165,6 +174,103 @@ __global__ void kernel2(const T* attn_weights,
     grad_attn[cur_block_offset] = grad_score;
 }
 
+template <typename T, typename shape_config>
+__global__ void
+kernel3(const T* grad_scores, const T* Q, const T* K, T* grad_Q, T* grad_K, float scale)
+{
+    const uint32_t block_id  = blockIdx.x;
+    const uint32_t thread_id = threadIdx.x;
+    constexpr int seq_q      = shape_config::seq_q;
+    constexpr int seq_kv     = shape_config::seq_kv;
+    constexpr int head_dim   = shape_config::head_dim;
+
+    const T* grad_scores_ptr = grad_scores + block_id * seq_q * seq_kv;
+    const T* Q_ptr           = Q + block_id * seq_q * head_dim;
+    const T* K_ptr           = K + block_id * seq_kv * head_dim;
+    T* grad_Q_ptr            = grad_Q + block_id * seq_q * head_dim;
+    T* grad_K_ptr            = grad_K + block_id * seq_kv * head_dim;
+
+    // compute grad_Q = grad_scores @ K
+#pragma unroll
+    for(int i = 0; i < seq_q; i++)
+    {
+        T sum = T(0.0f);
+#pragma unroll
+        for(int j = 0; j < seq_kv; j++)
+        {
+            sum += grad_scores_ptr[i * seq_kv + j] * K_ptr[j * head_dim + thread_id];
+        }
+        grad_Q_ptr[i * head_dim + thread_id] = sum * scale;
+    }
+#pragma unroll
+    for(int i = 0; i < seq_kv; i++)
+    {
+        T sum = T(0.0f);
+#pragma unroll
+        for(int j = 0; j < seq_q; j++)
+        {
+            sum += grad_scores_ptr[j * seq_kv + i] * Q_ptr[j * head_dim + thread_id];
+        }
+        grad_K_ptr[i * head_dim + thread_id] = sum * scale;
+    }
+}
+
+template <typename T, typename shape_config, typename parallel_policy>
+struct attn_backward_kernel_launcher
+{
+
+    static size_t calc_workspace_size()
+    {
+        constexpr int bs       = shape_config::bs;
+        constexpr int head_num = shape_config::head_num;
+        constexpr int seq_q    = shape_config::seq_q;
+        constexpr int seq_kv   = shape_config::seq_kv;
+
+        size_t workspace_size = bs * head_num * seq_q * seq_kv * sizeof(T);
+        return workspace_size;
+    }
+
+    static void run_attn_bwd_kernel(const T* Q,
+                                    const T* K,
+                                    const T* V,
+                                    const T* grad_O,
+                                    const T* attn_weights,
+                                    const T* mask,
+                                    const T* dropout_mask,
+                                    float dropout_p,
+                                    float sqr_dk_scale,
+                                    T* grad_Q,
+                                    T* grad_K,
+                                    T* grad_V,
+                                    T* workspace)
+    {
+        constexpr int bs       = shape_config::bs;
+        constexpr int head_num = shape_config::head_num;
+        constexpr int seq_q    = shape_config::seq_q;
+        constexpr int seq_kv   = shape_config::seq_kv;
+        constexpr int head_dim = shape_config::head_dim;
+
+        int merge_bs        = bs * head_num;
+        float scale         = sqr_dk_scale;
+        float dropout_scale = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
+
+        dim3 grid(merge_bs);
+        dim3 block(head_dim);
+
+        kernel1<T, shape_config><<<grid, block>>>(attn_weights, grad_O, V, grad_V, workspace);
+
+        dim3 grid2(merge_bs * seq_q * seq_kv / parallel_policy::step2_block_size);
+        dim3 block2(parallel_policy::step2_block_size);
+        kernel2<T, uint8_t, shape_config, parallel_policy>
+            <<<grid2, block2>>>(attn_weights,
+                                dropout_mask,
+                                reinterpret_cast<const uint8_t*>(mask),
+                                workspace,
+                                dropout_scale);
+
+        kernel3<T, shape_config><<<grid, block>>>(workspace, Q, K, grad_Q, grad_K, scale);
+    }
+};
 // Helper function: Matrix multiplication C = A @ B
 // A: [rows_a, cols_a], B: [cols_a, cols_b], C: [rows_a, cols_b]
 void matmul(const hip_bfloat16* A,
@@ -404,266 +510,180 @@ struct AttnTestConfig
 };
 
 /**
- * Run attn_backward computation with timing
- * Returns average execution time in milliseconds
+ * Test run_attn_bwd_kernel correctness and bandwidth
  */
-double run_attn_backward_computation(const AttnTestConfig& config)
-{
-    // Calculate sizes
-    size_t size_Q      = config.batch * config.head_num * config.q_seq * config.head_dim;
-    size_t size_K      = config.batch * config.head_num * config.kv_seq * config.head_dim;
-    size_t size_V      = config.batch * config.head_num * config.kv_seq * config.head_dim;
-    size_t size_grad_O = config.batch * config.head_num * config.q_seq * config.head_dim;
-    size_t size_attn   = config.batch * config.head_num * config.q_seq * config.kv_seq;
-
-    // Allocate memory
-    std::vector<hip_bfloat16> Q(size_Q);
-    std::vector<hip_bfloat16> K(size_K);
-    std::vector<hip_bfloat16> V(size_V);
-    std::vector<hip_bfloat16> grad_O(size_grad_O);
-    std::vector<hip_bfloat16> attn_weights(size_attn);
-    std::vector<hip_bfloat16> grad_Q(size_Q);
-    std::vector<hip_bfloat16> grad_K(size_K);
-    std::vector<hip_bfloat16> grad_V(size_V);
-
-    // Initialize with random data
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
-
-    for(size_t i = 0; i < size_Q; i++)
-        Q[i] = hip_bfloat16(dis(gen));
-    for(size_t i = 0; i < size_K; i++)
-        K[i] = hip_bfloat16(dis(gen));
-    for(size_t i = 0; i < size_V; i++)
-        V[i] = hip_bfloat16(dis(gen));
-    for(size_t i = 0; i < size_grad_O; i++)
-        grad_O[i] = hip_bfloat16(dis(gen));
-
-    // Initialize attention weights (softmax output, values in [0, 1])
-    for(size_t i = 0; i < size_attn; i++)
-    {
-        attn_weights[i] = hip_bfloat16(std::abs(dis(gen)));
-    }
-    // Normalize each row to sum to 1
-    for(int b = 0; b < config.batch; b++)
-    {
-        for(int h = 0; h < config.head_num; h++)
-        {
-            for(int n = 0; n < config.q_seq; n++)
-            {
-                int offset =
-                    (b * config.head_num + h) * config.q_seq * config.kv_seq + n * config.kv_seq;
-                float sum = 0.0f;
-                for(int m = 0; m < config.kv_seq; m++)
-                {
-                    sum += float(attn_weights[offset + m]);
-                }
-                if(sum > 0.0f)
-                {
-                    for(int m = 0; m < config.kv_seq; m++)
-                    {
-                        attn_weights[offset + m] =
-                            hip_bfloat16(float(attn_weights[offset + m]) / sum);
-                    }
-                }
-            }
-        }
-    }
-
-    // Warmup runs
-    for(int i = 0; i < config.warmup_iters; i++)
-    {
-        attn_backward(Q.data(),
-                      K.data(),
-                      V.data(),
-                      grad_O.data(),
-                      attn_weights.data(),
-                      nullptr,
-                      nullptr,
-                      config.dropout_p,
-                      grad_Q.data(),
-                      grad_K.data(),
-                      grad_V.data(),
-                      config.batch,
-                      config.head_num,
-                      config.q_seq,
-                      config.kv_seq,
-                      config.head_dim);
-    }
-
-    // Timed runs
-    auto start = std::chrono::high_resolution_clock::now();
-    for(int i = 0; i < config.test_iters; i++)
-    {
-        attn_backward(Q.data(),
-                      K.data(),
-                      V.data(),
-                      grad_O.data(),
-                      attn_weights.data(),
-                      nullptr,
-                      nullptr,
-                      config.dropout_p,
-                      grad_Q.data(),
-                      grad_K.data(),
-                      grad_V.data(),
-                      config.batch,
-                      config.head_num,
-                      config.q_seq,
-                      config.kv_seq,
-                      config.head_dim);
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-
-    // Calculate statistics
-    std::chrono::duration<double, std::milli> elapsed = end - start;
-    double avg_time_ms                                = elapsed.count() / config.test_iters;
-
-    return avg_time_ms;
-}
-
-/**
- * Test and report bandwidth of attn_backward function
- */
-void test_attn_backward_bandwidth(const AttnTestConfig& config)
-{
-    // Run computation and get timing
-    double avg_time_ms = run_attn_backward_computation(config);
-
-    // Calculate sizes for bandwidth computation
-    size_t size_Q      = config.batch * config.head_num * config.q_seq * config.head_dim;
-    size_t size_K      = config.batch * config.head_num * config.kv_seq * config.head_dim;
-    size_t size_V      = config.batch * config.head_num * config.kv_seq * config.head_dim;
-    size_t size_grad_O = config.batch * config.head_num * config.q_seq * config.head_dim;
-    size_t size_attn   = config.batch * config.head_num * config.q_seq * config.kv_seq;
-
-    // Calculate memory traffic (in bytes)
-    // Reads: Q, K, V, grad_O, attn_weights
-    // Writes: grad_Q, grad_K, grad_V
-    size_t bytes_read  = (size_Q + size_K + size_V + size_grad_O + size_attn) * sizeof(float);
-    size_t bytes_write = (size_Q + size_K + size_V) * sizeof(float);
-    size_t total_bytes = bytes_read + bytes_write;
-
-    double bandwidth_gbps = (total_bytes / 1e9) / (avg_time_ms / 1000.0);
-
-    // Print results
-    std::cout << "===== Attention Backward Bandwidth Test =====" << std::endl;
-    std::cout << "Configuration:" << std::endl;
-    std::cout << "  Batch size: " << config.batch << std::endl;
-    std::cout << "  Heads: " << config.head_num << std::endl;
-    std::cout << "  Q sequence length: " << config.q_seq << std::endl;
-    std::cout << "  KV sequence length: " << config.kv_seq << std::endl;
-    std::cout << "  Head dimension: " << config.head_dim << std::endl;
-    std::cout << std::endl;
-    std::cout << "Memory:" << std::endl;
-    std::cout << "  Total data read: " << std::fixed << std::setprecision(2) << bytes_read / 1e6
-              << " MB" << std::endl;
-    std::cout << "  Total data write: " << bytes_write / 1e6 << " MB" << std::endl;
-    std::cout << "  Total data transfer: " << total_bytes / 1e6 << " MB" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Performance:" << std::endl;
-    std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms"
-              << std::endl;
-    std::cout << "  Bandwidth: " << std::fixed << std::setprecision(2) << bandwidth_gbps << " GB/s"
-              << std::endl;
-    std::cout << "=============================================" << std::endl;
-}
-
-/**
- * Test kernel1 bandwidth
- */
-template <typename Config>
-void test_kernel1_bandwidth(const AttnTestConfig& config)
+template <typename Config, typename ParallelPolicy>
+void test_run_attn_bwd_kernel(const AttnTestConfig& config)
 {
     using DataType = hip_bfloat16;
+    using Launcher = attn_backward_kernel_launcher<DataType, Config, ParallelPolicy>;
 
     // Validate config matches template parameters
-    if(config.q_seq != Config::seq_q || config.kv_seq != Config::seq_kv ||
+    if(config.batch != Config::bs || config.head_num != Config::head_num ||
+       config.q_seq != Config::seq_q || config.kv_seq != Config::seq_kv ||
        config.head_dim != Config::head_dim)
     {
         std::cerr << "Error: Config mismatch with template parameters!" << std::endl;
         return;
     }
 
+    constexpr int bs       = Config::bs;
+    constexpr int head_num = Config::head_num;
     constexpr int seq_q    = Config::seq_q;
     constexpr int seq_kv   = Config::seq_kv;
     constexpr int head_dim = Config::head_dim;
 
-    const int merge_bs = config.batch * config.head_num;
-
     // Calculate sizes
-    size_t size_attn_weights = merge_bs * seq_q * seq_kv;
-    size_t size_grad_O       = merge_bs * seq_q * head_dim;
-    size_t size_V            = merge_bs * seq_kv * head_dim;
-    size_t size_grad_V       = merge_bs * seq_kv * head_dim;
-    size_t size_workspace    = merge_bs * seq_q * seq_kv;
+    size_t size_Q            = bs * head_num * seq_q * head_dim;
+    size_t size_K            = bs * head_num * seq_kv * head_dim;
+    size_t size_V            = bs * head_num * seq_kv * head_dim;
+    size_t size_grad_O       = bs * head_num * seq_q * head_dim;
+    size_t size_attn_weights = bs * head_num * seq_q * seq_kv;
+    size_t size_mask         = bs * head_num * seq_q * seq_kv;
+    size_t size_dropout_mask = bs * head_num * seq_q * seq_kv;
 
     // Allocate host memory
-    std::vector<DataType> h_attn_weights(size_attn_weights);
-    std::vector<DataType> h_grad_O(size_grad_O);
+    std::vector<DataType> h_Q(size_Q);
+    std::vector<DataType> h_K(size_K);
     std::vector<DataType> h_V(size_V);
-    std::vector<DataType> h_grad_V(size_grad_V);
-    std::vector<DataType> h_workspace(size_workspace);
+    std::vector<DataType> h_grad_O(size_grad_O);
+    std::vector<DataType> h_attn_weights(size_attn_weights);
+    std::vector<DataType> h_mask(size_mask);
+    std::vector<DataType> h_dropout_mask(size_dropout_mask);
+    std::vector<DataType> h_grad_Q_gpu(size_Q);
+    std::vector<DataType> h_grad_K_gpu(size_K);
+    std::vector<DataType> h_grad_V_gpu(size_V);
+    std::vector<DataType> h_grad_Q_cpu(size_Q);
+    std::vector<DataType> h_grad_K_cpu(size_K);
+    std::vector<DataType> h_grad_V_cpu(size_V);
 
     // Initialize with random data
     std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen(42); // Fixed seed for reproducibility
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
-    for(size_t i = 0; i < size_attn_weights; i++)
-        h_attn_weights[i] = hip_bfloat16(std::abs(dis(gen)));
-    for(size_t i = 0; i < size_grad_O; i++)
-        h_grad_O[i] = hip_bfloat16(dis(gen));
+    for(size_t i = 0; i < size_Q; i++)
+        h_Q[i] = hip_bfloat16(dis(gen));
+    for(size_t i = 0; i < size_K; i++)
+        h_K[i] = hip_bfloat16(dis(gen));
     for(size_t i = 0; i < size_V; i++)
         h_V[i] = hip_bfloat16(dis(gen));
+    for(size_t i = 0; i < size_grad_O; i++)
+        h_grad_O[i] = hip_bfloat16(dis(gen));
 
-    // Normalize attention weights (each row sums to 1)
-    for(int mb = 0; mb < merge_bs; mb++)
+    // Initialize attention weights (normalized softmax output)
+    for(int b = 0; b < bs; b++)
     {
-        for(int i = 0; i < seq_q; i++)
+        for(int h = 0; h < head_num; h++)
         {
-            float sum = 0.0f;
-            for(int j = 0; j < seq_kv; j++)
+            for(int i = 0; i < seq_q; i++)
             {
-                sum += float(h_attn_weights[mb * seq_q * seq_kv + i * seq_kv + j]);
-            }
-            if(sum > 0.0f)
-            {
+                float sum = 0.0f;
                 for(int j = 0; j < seq_kv; j++)
                 {
-                    h_attn_weights[mb * seq_q * seq_kv + i * seq_kv + j] = hip_bfloat16(
-                        float(h_attn_weights[mb * seq_q * seq_kv + i * seq_kv + j]) / sum);
+                    int idx             = ((b * head_num + h) * seq_q + i) * seq_kv + j;
+                    h_attn_weights[idx] = hip_bfloat16(std::abs(dis(gen)));
+                    sum += float(h_attn_weights[idx]);
+                }
+                if(sum > 0.0f)
+                {
+                    for(int j = 0; j < seq_kv; j++)
+                    {
+                        int idx             = ((b * head_num + h) * seq_q + i) * seq_kv + j;
+                        h_attn_weights[idx] = hip_bfloat16(float(h_attn_weights[idx]) / sum);
+                    }
                 }
             }
         }
     }
 
+    // Initialize mask (1 = keep, 0 = mask out)
+    for(size_t i = 0; i < size_mask; i++)
+    {
+        h_mask[i] = ParallelPolicy::enable_mask ? hip_bfloat16(dis(gen) > 0.0f ? 1.0f : 0.0f)
+                                                : hip_bfloat16(1.0f);
+    }
+
+    // Initialize dropout mask (1 = keep, 0 = drop)
+    for(size_t i = 0; i < size_dropout_mask; i++)
+    {
+        h_dropout_mask[i] = ParallelPolicy::enable_dropout_mask
+                                ? hip_bfloat16(dis(gen) > config.dropout_p ? 1.0f : 0.0f)
+                                : hip_bfloat16(1.0f);
+    }
+
+    // Compute CPU reference
+    float sqr_dk_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    attn_backward(h_Q.data(),
+                  h_K.data(),
+                  h_V.data(),
+                  h_grad_O.data(),
+                  h_attn_weights.data(),
+                  ParallelPolicy::enable_mask ? h_mask.data() : nullptr,
+                  ParallelPolicy::enable_dropout_mask ? h_dropout_mask.data() : nullptr,
+                  config.dropout_p,
+                  h_grad_Q_cpu.data(),
+                  h_grad_K_cpu.data(),
+                  h_grad_V_cpu.data(),
+                  bs,
+                  head_num,
+                  seq_q,
+                  seq_kv,
+                  head_dim);
+
     // Allocate device memory
-    DataType *d_attn_weights, *d_grad_O, *d_V, *d_grad_V, *d_workspace;
-    HIP_CHECK(hipMalloc(&d_attn_weights, size_attn_weights * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_grad_O, size_grad_O * sizeof(DataType)));
+    DataType *d_Q, *d_K, *d_V, *d_grad_O, *d_attn_weights;
+    DataType *d_mask, *d_dropout_mask;
+    DataType *d_grad_Q, *d_grad_K, *d_grad_V, *d_workspace;
+
+    HIP_CHECK(hipMalloc(&d_Q, size_Q * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_K, size_K * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_V, size_V * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_grad_V, size_grad_V * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_workspace, size_workspace * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_grad_O, size_grad_O * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_attn_weights, size_attn_weights * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_mask, size_mask * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_dropout_mask, size_dropout_mask * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_grad_Q, size_Q * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_grad_K, size_K * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_grad_V, size_V * sizeof(DataType)));
+
+    size_t workspace_size = Launcher::calc_workspace_size();
+    HIP_CHECK(hipMalloc(&d_workspace, workspace_size));
 
     // Copy data to device
+    HIP_CHECK(hipMemcpy(d_Q, h_Q.data(), size_Q * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_K, h_K.data(), size_K * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_V, h_V.data(), size_V * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(
+        d_grad_O, h_grad_O.data(), size_grad_O * sizeof(DataType), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_attn_weights,
                         h_attn_weights.data(),
                         size_attn_weights * sizeof(DataType),
                         hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(
-        d_grad_O, h_grad_O.data(), size_grad_O * sizeof(DataType), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_V, h_V.data(), size_V * sizeof(DataType), hipMemcpyHostToDevice));
-
-    // Kernel launch configuration
-    dim3 grid(merge_bs);  // Each block handles one merged batch
-    dim3 block(head_dim); // Each block has head_dim threads
+    HIP_CHECK(
+        hipMemcpy(d_mask, h_mask.data(), size_mask * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_dropout_mask,
+                        h_dropout_mask.data(),
+                        size_dropout_mask * sizeof(DataType),
+                        hipMemcpyHostToDevice));
 
     // Warmup runs
     for(int i = 0; i < config.warmup_iters; i++)
     {
-        kernel1<DataType, Config>
-            <<<grid, block>>>(d_attn_weights, d_grad_O, d_V, d_grad_V, d_workspace);
+        Launcher::run_attn_bwd_kernel(d_Q,
+                                      d_K,
+                                      d_V,
+                                      d_grad_O,
+                                      d_attn_weights,
+                                      ParallelPolicy::enable_mask ? d_mask : nullptr,
+                                      ParallelPolicy::enable_dropout_mask ? d_dropout_mask
+                                                                          : nullptr,
+                                      config.dropout_p,
+                                      sqr_dk_scale,
+                                      d_grad_Q,
+                                      d_grad_K,
+                                      d_grad_V,
+                                      d_workspace);
     }
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -675,8 +695,20 @@ void test_kernel1_bandwidth(const AttnTestConfig& config)
     HIP_CHECK(hipEventRecord(start));
     for(int i = 0; i < config.test_iters; i++)
     {
-        kernel1<DataType, Config>
-            <<<grid, block>>>(d_attn_weights, d_grad_O, d_V, d_grad_V, d_workspace);
+        Launcher::run_attn_bwd_kernel(d_Q,
+                                      d_K,
+                                      d_V,
+                                      d_grad_O,
+                                      d_attn_weights,
+                                      ParallelPolicy::enable_mask ? d_mask : nullptr,
+                                      ParallelPolicy::enable_dropout_mask ? d_dropout_mask
+                                                                          : nullptr,
+                                      config.dropout_p,
+                                      sqr_dk_scale,
+                                      d_grad_Q,
+                                      d_grad_K,
+                                      d_grad_V,
+                                      d_workspace);
     }
     HIP_CHECK(hipEventRecord(stop));
     HIP_CHECK(hipEventSynchronize(stop));
@@ -685,52 +717,100 @@ void test_kernel1_bandwidth(const AttnTestConfig& config)
     HIP_CHECK(hipEventElapsedTime(&elapsed_ms, start, stop));
     double avg_time_ms = elapsed_ms / config.test_iters;
 
-    // Copy results back (optional, for verification)
-    HIP_CHECK(hipMemcpy(
-        h_grad_V.data(), d_grad_V, size_grad_V * sizeof(DataType), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(
-        h_workspace.data(), d_workspace, size_workspace * sizeof(DataType), hipMemcpyDeviceToHost));
+    // Copy results back
+    HIP_CHECK(
+        hipMemcpy(h_grad_Q_gpu.data(), d_grad_Q, size_Q * sizeof(DataType), hipMemcpyDeviceToHost));
+    HIP_CHECK(
+        hipMemcpy(h_grad_K_gpu.data(), d_grad_K, size_K * sizeof(DataType), hipMemcpyDeviceToHost));
+    HIP_CHECK(
+        hipMemcpy(h_grad_V_gpu.data(), d_grad_V, size_V * sizeof(DataType), hipMemcpyDeviceToHost));
+
+    // Check correctness
+    auto check_results = [](const std::vector<DataType>& gpu,
+                            const std::vector<DataType>& cpu,
+                            const std::string& name,
+                            float tolerance = 1e-2) {
+        float max_diff     = 0.0f;
+        float max_rel_diff = 0.0f;
+        size_t diff_count  = 0;
+
+        for(size_t i = 0; i < gpu.size(); i++)
+        {
+            float diff     = std::abs(float(gpu[i]) - float(cpu[i]));
+            float rel_diff = diff / (std::abs(float(cpu[i])) + 1e-6f);
+            max_diff       = std::max(max_diff, diff);
+            max_rel_diff   = std::max(max_rel_diff, rel_diff);
+            if(rel_diff > tolerance)
+            {
+                diff_count++;
+            }
+        }
+
+        std::cout << name << " check:" << std::endl;
+        std::cout << "  Max absolute diff: " << max_diff << std::endl;
+        std::cout << "  Max relative diff: " << max_rel_diff << std::endl;
+        std::cout << "  Elements exceeding tolerance: " << diff_count << " / " << gpu.size()
+                  << std::endl;
+        std::cout << "  Status: " << (max_rel_diff < tolerance ? "PASS" : "FAIL") << std::endl;
+    };
 
     // Calculate bandwidth
-    // Reads: attn_weights, grad_O, V (multiple times in loops)
-    // Writes: grad_V, workspace
-    size_t bytes_read  = (size_attn_weights + size_grad_O + size_V) * sizeof(DataType);
-    size_t bytes_write = (size_grad_V + size_workspace) * sizeof(DataType);
-    size_t total_bytes = bytes_read + bytes_write;
+    size_t bytes_read =
+        (size_Q + size_K + size_V + size_grad_O + size_attn_weights) * sizeof(DataType);
+    if(ParallelPolicy::enable_mask)
+        bytes_read += size_mask * sizeof(DataType);
+    if(ParallelPolicy::enable_dropout_mask)
+        bytes_read += size_dropout_mask * sizeof(DataType);
 
+    size_t bytes_write = (size_Q + size_K + size_V) * sizeof(DataType);
+    size_t total_bytes = bytes_read + bytes_write;
+    std::cout << "~~~~~~~~~~~" << total_bytes << std::endl;
     double bandwidth_gbps = (total_bytes / 1e9) / (avg_time_ms / 1000.0);
 
     // Print results
-    std::cout << "===== Kernel1 Bandwidth Test =====" << std::endl;
+    std::cout << "\n===== run_attn_bwd_kernel Test =====" << std::endl;
     std::cout << "Configuration:" << std::endl;
-    std::cout << "  Batch size: " << config.batch << std::endl;
-    std::cout << "  Heads: " << config.head_num << std::endl;
-    std::cout << "  Merged BS: " << merge_bs << std::endl;
+    std::cout << "  Batch size: " << bs << std::endl;
+    std::cout << "  Heads: " << head_num << std::endl;
     std::cout << "  Q sequence length: " << seq_q << std::endl;
     std::cout << "  KV sequence length: " << seq_kv << std::endl;
     std::cout << "  Head dimension: " << head_dim << std::endl;
+    std::cout << "  Dropout: " << (ParallelPolicy::enable_dropout_mask ? "enabled" : "disabled")
+              << std::endl;
+    std::cout << "  Mask: " << (ParallelPolicy::enable_mask ? "enabled" : "disabled") << std::endl;
     std::cout << std::endl;
-    std::cout << "Kernel Launch:" << std::endl;
-    std::cout << "  Grid: (" << merge_bs << ")" << std::endl;
-    std::cout << "  Block: (" << head_dim << ")" << std::endl;
+
+    std::cout << "Correctness:" << std::endl;
+    check_results(h_grad_Q_gpu, h_grad_Q_cpu, "grad_Q");
+    check_results(h_grad_K_gpu, h_grad_K_cpu, "grad_K");
+    check_results(h_grad_V_gpu, h_grad_V_cpu, "grad_V");
     std::cout << std::endl;
+
     std::cout << "Memory:" << std::endl;
     std::cout << "  Total data read: " << std::fixed << std::setprecision(2) << bytes_read / 1e6
               << " MB" << std::endl;
     std::cout << "  Total data write: " << bytes_write / 1e6 << " MB" << std::endl;
     std::cout << "  Total data transfer: " << total_bytes / 1e6 << " MB" << std::endl;
+    std::cout << "  Workspace size: " << workspace_size / 1e6 << " MB" << std::endl;
     std::cout << std::endl;
+
     std::cout << "Performance:" << std::endl;
     std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms"
               << std::endl;
     std::cout << "  Bandwidth: " << std::fixed << std::setprecision(2) << bandwidth_gbps << " GB/s"
               << std::endl;
-    std::cout << "====================================" << std::endl;
+    std::cout << "====================================\n" << std::endl;
 
     // Cleanup
-    HIP_CHECK(hipFree(d_attn_weights));
-    HIP_CHECK(hipFree(d_grad_O));
+    HIP_CHECK(hipFree(d_Q));
+    HIP_CHECK(hipFree(d_K));
     HIP_CHECK(hipFree(d_V));
+    HIP_CHECK(hipFree(d_grad_O));
+    HIP_CHECK(hipFree(d_attn_weights));
+    HIP_CHECK(hipFree(d_mask));
+    HIP_CHECK(hipFree(d_dropout_mask));
+    HIP_CHECK(hipFree(d_grad_Q));
+    HIP_CHECK(hipFree(d_grad_K));
     HIP_CHECK(hipFree(d_grad_V));
     HIP_CHECK(hipFree(d_workspace));
     HIP_CHECK(hipEventDestroy(start));
@@ -740,17 +820,14 @@ void test_kernel1_bandwidth(const AttnTestConfig& config)
 int main(int argc, char const* argv[])
 {
     // Create test configuration
-    AttnTestConfig config(30720, 16, 1, 2, 128, 0.0f, 0, 1);
+    using KernelConfig   = fmha_kernel_config<30720, 16, 2, 1, 256>;
+    using ParallelPolicy = fmha_kernel_parallel_policy<256, true, true>;
 
-    // Test CPU reference implementation
-    // test_attn_backward_bandwidth(config);
+    AttnTestConfig config(30720, 16, 2, 1, 256, 0.0f, 0, 1);
 
-    // std::cout << "\n\n";
-
-    // Test GPU kernel1
-    // Define config type matching the test parameters
-    using KernelConfig = fmha_kernel_config<30720, 16, 1, 2, 128>;
-    test_kernel1_bandwidth<KernelConfig>(config);
+    // Test without mask and dropout
+    std::cout << "Testing with mask and dropout:" << std::endl;
+    test_run_attn_bwd_kernel<KernelConfig, ParallelPolicy>(config);
 
     return 0;
 }
