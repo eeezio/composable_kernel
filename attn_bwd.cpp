@@ -713,6 +713,20 @@ void test_run_attn_bwd_kernel(
     HIP_CHECK(hipEventElapsedTime(&elapsed_ms, start, stop));
     double avg_time_ms = elapsed_ms / test_iters;
 
+    // Calculate TFLOPS
+    // Main matrix operations in attention backward:
+    // 1. grad_V = attn_weights^T @ grad_O: [kv_seq, q_seq] @ [q_seq, head_dim]
+    // 2. grad_attn = grad_O @ V^T: [q_seq, head_dim] @ [head_dim, kv_seq]
+    // 3. grad_Q = grad_scores @ K: [q_seq, kv_seq] @ [kv_seq, head_dim]
+    // 4. grad_K = grad_scores^T @ Q: [kv_seq, q_seq] @ [q_seq, head_dim]
+    // Each matmul: FLOPs = 2 * M * N * K (multiply-add)
+    double flops_per_batch_head = 2.0 * seq_kv * head_dim * seq_q + // grad_V
+                                  2.0 * seq_q * seq_kv * head_dim + // grad_attn
+                                  2.0 * seq_q * head_dim * seq_kv + // grad_Q
+                                  2.0 * seq_kv * head_dim * seq_q;  // grad_K
+    double total_flops = flops_per_batch_head * bs * head_num;
+    double tflops      = (total_flops / 1e12) / (avg_time_ms / 1000.0);
+
     // Copy results back
     HIP_CHECK(
         hipMemcpy(h_grad_Q_gpu.data(), d_grad_Q, size_Q * sizeof(DataType), hipMemcpyDeviceToHost));
@@ -802,6 +816,7 @@ void test_run_attn_bwd_kernel(
               << std::endl;
     std::cout << "  Bandwidth: " << std::fixed << std::setprecision(2) << bandwidth_gbps << " GB/s"
               << std::endl;
+    std::cout << "  TFLOPS: " << std::fixed << std::setprecision(2) << tflops << std::endl;
     std::cout << "====================================\n" << std::endl;
 
     // Cleanup
