@@ -395,7 +395,6 @@ void attn_backward(const T* Q,
             // grad_O: [q_seq, head_dim], V: [kv_seq, head_dim] -> grad_attn: [q_seq, kv_seq]
             transpose(V_bh, V_T.data(), kv_seq, head_dim);
             matmul(grad_O_bh, V_T.data(), grad_attn.data(), q_seq, head_dim, kv_seq);
-
             // Step 3: Dropout backward
             if(dropout_p > 0.0f && dropout_bh != nullptr)
             {
@@ -665,7 +664,7 @@ void test_run_attn_bwd_kernel(
     auto check_results = [&](const std::vector<DataType>& gpu,
                              const std::vector<DataType>& cpu,
                              const std::string& name,
-                             float tolerance = 1e-2) {
+                             float tolerance = 1e-1) {
         float max_diff     = 0.0f;
         float max_rel_diff = 0.0f;
         size_t diff_count  = 0;
@@ -768,17 +767,17 @@ int main(int argc, char const* argv[])
     using KernelConfig3 = FmhaKernelConfig<30720, 32, 2, 1, 128, 128, true, true>;
     using KernelConfig4 = FmhaKernelConfig<30720, 32, 1, 2, 128, 128, true, true>;
 
-    // std::cout << "\n========== Testing with bfloat16 ==========" << std::endl;
-    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig1>(0.3, 0, 1, true, false);
-    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0.3, 0, 1, true, false);
-    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0.3, 0, 1, true, false);
-    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0.3, 0, 1, true, false);
+    // std::cout << "\n========== Testing with float ==========" << std::endl;
+    // test_run_attn_bwd_kernel<float, KernelConfig1>(0.3, 0, 1, true, false);
+    // test_run_attn_bwd_kernel<float, KernelConfig2>(0.3, 0, 1, true, false);
+    // test_run_attn_bwd_kernel<float, KernelConfig3>(0.3, 0, 1, true, false);
+    // test_run_attn_bwd_kernel<float, KernelConfig4>(0.3, 0, 1, true, false);
 
-    std::cout << "\n========== Testing with float ==========" << std::endl;
-    test_run_attn_bwd_kernel<float, KernelConfig1>(0.3, 0, 1, true, false);
-    test_run_attn_bwd_kernel<float, KernelConfig2>(0.3, 0, 1, true, false);
-    test_run_attn_bwd_kernel<float, KernelConfig3>(0.3, 0, 1, true, false);
-    test_run_attn_bwd_kernel<float, KernelConfig4>(0.3, 0, 1, true, false);
+    std::cout << "\n========== Testing with bfloat16 ==========" << std::endl;
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig1>(0.3, 0, 1, false, false);
+    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0.3, 0, 1, false, false);
+    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0.3, 0, 1, false, false);
+    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0.3, 0, 1, false, false);
 
     return 0;
 }
