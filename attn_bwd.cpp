@@ -53,9 +53,11 @@ __global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
                                                     T* grad_V,
                                                     T* workspace) // store grad_attn
 {
-    constexpr int seq_q    = Config::seq_q;
-    constexpr int seq_kv   = Config::seq_kv;
-    constexpr int head_dim = Config::head_dim;
+    constexpr int seq_q                       = Config::seq_q;
+    constexpr int seq_kv                      = Config::seq_kv;
+    constexpr int head_dim                    = Config::head_dim;
+    constexpr int warp_size                   = 64;
+    constexpr int process_head_dim_per_thread = head_dim / warp_size;
 
     const uint32_t block_id  = blockIdx.x;
     const uint32_t thread_id = threadIdx.x;
@@ -70,26 +72,45 @@ __global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
 #pragma unroll
     for(int i = 0; i < seq_q; i++)
     {
-        fetch_grad_O[i * head_dim + thread_id] = grad_O_ptr[i * head_dim + thread_id];
+#pragma unroll
+        for(int k = 0; k < process_head_dim_per_thread; k++)
+        {
+            fetch_grad_O[i * head_dim + thread_id * process_head_dim_per_thread + k] =
+                grad_O_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k];
+        }
     }
     __syncthreads();
 // compute grad_V = attn_weights^T @ grad_O
 #pragma unroll
     for(int i = 0; i < seq_kv; i++)
     {
-        T sum = T(0.0f);
+        T sums[process_head_dim_per_thread];
+#pragma unroll
+        for(int k = 0; k < process_head_dim_per_thread; k++)
+        {
+            sums[k] = T(0.0f);
+        }
 #pragma unroll
         for(int j = 0; j < seq_q; j++)
         {
-            sum += attn_weights_ptr[j * seq_kv + i] * fetch_grad_O[j * head_dim + thread_id];
+#pragma unroll
+            for(int k = 0; k < process_head_dim_per_thread; k++)
+            {
+                sums[k] += attn_weights_ptr[j * seq_kv + i] *
+                           fetch_grad_O[j * head_dim + thread_id * process_head_dim_per_thread + k];
+            }
         }
-        grad_V_ptr[i * head_dim + thread_id] = sum;
+#pragma unroll
+        for(int k = 0; k < process_head_dim_per_thread; k++)
+        {
+            grad_V_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k] = sums[k];
+        }
     }
     __syncthreads();
 
     // compute grad_attn = grad_O @ V^T
     // Each thread computes partial sum over head_dim, then reduce
-    __shared__ T reduce_buffer[head_dim];
+    __shared__ T reduce_buffer[head_dim / process_head_dim_per_thread];
 
 #pragma unroll
     for(int i = 0; i < seq_q; i++)
@@ -99,12 +120,18 @@ __global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
         {
             // Each thread computes one element of the dot product
             T partial_sum = T(0.0f);
-            partial_sum = fetch_grad_O[i * head_dim + thread_id] * V_ptr[j * head_dim + thread_id];
+#pragma unroll
+            for(int k = 0; k < process_head_dim_per_thread; k++)
+            {
+                partial_sum +=
+                    fetch_grad_O[i * head_dim + thread_id * process_head_dim_per_thread + k] *
+                    V_ptr[j * head_dim + thread_id * process_head_dim_per_thread + k];
+            }
             reduce_buffer[thread_id] = partial_sum;
             __syncthreads();
 
             // Parallel reduction in shared memory
-            for(int stride = head_dim / 2; stride > 0; stride >>= 1)
+            for(int stride = head_dim / (2 * process_head_dim_per_thread); stride > 0; stride >>= 1)
             {
                 if(thread_id < stride)
                 {
@@ -181,11 +208,13 @@ template <typename T, typename Config>
 __global__ void compute_grad_q_and_grad_k_kernel(
     const T* grad_scores, const T* Q, const T* K, T* grad_Q, T* grad_K, float scale)
 {
-    const uint32_t block_id  = blockIdx.x;
-    const uint32_t thread_id = threadIdx.x;
-    constexpr int seq_q      = Config::seq_q;
-    constexpr int seq_kv     = Config::seq_kv;
-    constexpr int head_dim   = Config::head_dim;
+    const uint32_t block_id                   = blockIdx.x;
+    const uint32_t thread_id                  = threadIdx.x;
+    constexpr int seq_q                       = Config::seq_q;
+    constexpr int seq_kv                      = Config::seq_kv;
+    constexpr int head_dim                    = Config::head_dim;
+    constexpr int warp_size                   = 64;
+    constexpr int process_head_dim_per_thread = head_dim / warp_size;
 
     const T* grad_scores_ptr = grad_scores + block_id * seq_q * seq_kv;
     const T* Q_ptr           = Q + block_id * seq_q * head_dim;
@@ -197,24 +226,55 @@ __global__ void compute_grad_q_and_grad_k_kernel(
 #pragma unroll
     for(int i = 0; i < seq_q; i++)
     {
-        T sum = T(0.0f);
+        T sums[process_head_dim_per_thread];
+#pragma unroll
+        for(int k = 0; k < process_head_dim_per_thread; k++)
+        {
+            sums[k] = T(0.0f);
+        }
 #pragma unroll
         for(int j = 0; j < seq_kv; j++)
         {
-            sum += grad_scores_ptr[i * seq_kv + j] * K_ptr[j * head_dim + thread_id];
+#pragma unroll
+            for(int k = 0; k < process_head_dim_per_thread; k++)
+            {
+                sums[k] += grad_scores_ptr[i * seq_kv + j] *
+                           K_ptr[j * head_dim + thread_id * process_head_dim_per_thread + k];
+            }
         }
-        grad_Q_ptr[i * head_dim + thread_id] = sum * scale;
+#pragma unroll
+        for(int k = 0; k < process_head_dim_per_thread; k++)
+        {
+            grad_Q_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k] =
+                sums[k] * scale;
+        }
     }
+    // compute grad_K = grad_scores^T @ Q
 #pragma unroll
     for(int i = 0; i < seq_kv; i++)
     {
-        T sum = T(0.0f);
+        T sums[process_head_dim_per_thread];
+#pragma unroll
+        for(int k = 0; k < process_head_dim_per_thread; k++)
+        {
+            sums[k] = T(0.0f);
+        }
 #pragma unroll
         for(int j = 0; j < seq_q; j++)
         {
-            sum += grad_scores_ptr[j * seq_kv + i] * Q_ptr[j * head_dim + thread_id];
+#pragma unroll
+            for(int k = 0; k < process_head_dim_per_thread; k++)
+            {
+                sums[k] += grad_scores_ptr[j * seq_kv + i] *
+                           Q_ptr[j * head_dim + thread_id * process_head_dim_per_thread + k];
+            }
         }
-        grad_K_ptr[i * head_dim + thread_id] = sum * scale;
+#pragma unroll
+        for(int k = 0; k < process_head_dim_per_thread; k++)
+        {
+            grad_K_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k] =
+                sums[k] * scale;
+        }
     }
 }
 
@@ -247,18 +307,19 @@ struct AttnBackwardKernelLauncher
                                     T* grad_V,
                                     T* workspace)
     {
-        constexpr int bs       = Config::bs;
-        constexpr int head_num = Config::head_num;
-        constexpr int seq_q    = Config::seq_q;
-        constexpr int seq_kv   = Config::seq_kv;
-        constexpr int head_dim = Config::head_dim;
+        constexpr int bs        = Config::bs;
+        constexpr int head_num  = Config::head_num;
+        constexpr int seq_q     = Config::seq_q;
+        constexpr int seq_kv    = Config::seq_kv;
+        constexpr int head_dim  = Config::head_dim;
+        constexpr int warp_size = 64;
 
         constexpr int merge_bs = bs * head_num;
         float scale            = sqr_dk_scale;
         float dropout_scale    = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
 
         dim3 grid(merge_bs);
-        dim3 block(head_dim);
+        dim3 block(warp_size);
 
         compute_grad_v_and_grad_attn_kernel<T, Config>
             <<<grid, block>>>(attn_weights, grad_O, V, grad_V, workspace);
@@ -768,16 +829,16 @@ int main(int argc, char const* argv[])
     using KernelConfig4 = FmhaKernelConfig<30720, 32, 1, 2, 128, 128, true, true>;
 
     // std::cout << "\n========== Testing with float ==========" << std::endl;
-    // test_run_attn_bwd_kernel<float, KernelConfig1>(0.3, 0, 1, true, false);
-    // test_run_attn_bwd_kernel<float, KernelConfig2>(0.3, 0, 1, true, false);
-    // test_run_attn_bwd_kernel<float, KernelConfig3>(0.3, 0, 1, true, false);
-    // test_run_attn_bwd_kernel<float, KernelConfig4>(0.3, 0, 1, true, false);
+    test_run_attn_bwd_kernel<float, KernelConfig1>(0.3, 0, 1, true, false);
+    test_run_attn_bwd_kernel<float, KernelConfig2>(0.3, 0, 1, true, false);
+    test_run_attn_bwd_kernel<float, KernelConfig3>(0.3, 0, 1, true, false);
+    test_run_attn_bwd_kernel<float, KernelConfig4>(0.3, 0, 1, true, false);
 
     std::cout << "\n========== Testing with bfloat16 ==========" << std::endl;
     test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig1>(0.3, 0, 1, false, false);
-    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0.3, 0, 1, false, false);
-    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0.3, 0, 1, false, false);
-    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0.3, 0, 1, false, false);
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0.3, 0, 1, false, false);
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0.3, 0, 1, false, false);
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0.3, 0, 1, false, false);
 
     return 0;
 }
