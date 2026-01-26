@@ -165,25 +165,15 @@ __global__ void apply_softmax_backward_kernel(const T* attn_weights,
         reduce_grad_score[thread_id] = sum;
     }
     __syncthreads();
-    // if(thread_id < reduce_score_num)
-    //     printf("thread_id=%d, reduce_grad_score_value=%f\n",
-    //            thread_id,
-    //            static_cast<float>(reduce_grad_score[thread_id]));
     grad_score -= attn_weight * reduce_grad_score[thread_id / seq_kv];
     if constexpr(Config::enable_mask)
     {
         mask_type cur_thread_mask = mask[cur_block_offset];
-        // printf("block_id=%d, thread_id=%d, mask_value=%d\n", block_id, thread_id,
-        // cur_thread_mask);
         if(cur_thread_mask == 0)
         {
             grad_score = T(0.0f);
         }
     }
-    // printf("block_id=%d, thread_id=%d, before dropout, grad_score=%f\n",
-    //        block_id,
-    //        thread_id,
-    //        static_cast<float>(grad_score));
     grad_attn[cur_block_offset] = grad_score;
 }
 
@@ -285,12 +275,8 @@ struct AttnBackwardKernelLauncher
 };
 // Helper function: Matrix multiplication C = A @ B
 // A: [rows_a, cols_a], B: [cols_a, cols_b], C: [rows_a, cols_b]
-void matmul(const hip_bfloat16* A,
-            const hip_bfloat16* B,
-            hip_bfloat16* C,
-            int rows_a,
-            int cols_a,
-            int cols_b)
+template <typename T>
+void matmul(const T* A, const T* B, T* C, int rows_a, int cols_a, int cols_b)
 {
     for(int i = 0; i < rows_a; i++)
     {
@@ -301,13 +287,14 @@ void matmul(const hip_bfloat16* A,
             {
                 sum += float(A[i * cols_a + k]) * float(B[k * cols_b + j]);
             }
-            C[i * cols_b + j] = hip_bfloat16(sum);
+            C[i * cols_b + j] = T(sum);
         }
     }
 }
 
 // Helper function: Matrix transpose
-void transpose(const hip_bfloat16* A, hip_bfloat16* A_T, int rows, int cols)
+template <typename T>
+void transpose(const T* A, T* A_T, int rows, int cols)
 {
     for(int i = 0; i < rows; i++)
     {
@@ -319,7 +306,8 @@ void transpose(const hip_bfloat16* A, hip_bfloat16* A_T, int rows, int cols)
 }
 
 // Helper function: Sum along last dimension
-void sum_last_dim(const hip_bfloat16* A, hip_bfloat16* sums, int rows, int cols)
+template <typename T>
+void sum_last_dim(const T* A, T* sums, int rows, int cols)
 {
     for(int i = 0; i < rows; i++)
     {
@@ -328,42 +316,25 @@ void sum_last_dim(const hip_bfloat16* A, hip_bfloat16* sums, int rows, int cols)
         {
             sum += float(A[i * cols + j]);
         }
-        sums[i] = hip_bfloat16(sum);
+        sums[i] = T(sum);
     }
 }
 
 /**
  * Multi-Head Attention Backward Pass (CPU Reference Implementation)
- *
- * @param Q: Query tensor [batch, head_num, q_seq, head_dim]
- * @param K: Key tensor [batch, head_num, kv_seq, head_dim]
- * @param V: Value tensor [batch, head_num, kv_seq, head_dim]
- * @param grad_O: Gradient of output [batch, head_num, q_seq, head_dim]
- * @param attn_weights: Attention weights from forward pass [batch, head_num, q_seq, kv_seq]
- * @param mask: Optional mask [batch, head_num, q_seq, kv_seq] (nullptr if not used), uint8_t type
- * @param dropout_mask: Optional dropout mask [batch, head_num, q_seq, kv_seq] (nullptr if not
- * used), hip_bfloat16 type (0.0 or 1.0)
- * @param dropout_p: Dropout probability
- * @param grad_Q: Output gradient for Q [batch, head_num, q_seq, head_dim]
- * @param grad_K: Output gradient for K [batch, head_num, kv_seq, head_dim]
- * @param grad_V: Output gradient for V [batch, head_num, kv_seq, head_dim]
- * @param batch: Batch size
- * @param head_num: Number of heads
- * @param q_seq: Query sequence length
- * @param kv_seq: Key/Value sequence length
- * @param head_dim: Head dimension
  */
-void attn_backward(const hip_bfloat16* Q,
-                   const hip_bfloat16* K,
-                   const hip_bfloat16* V,
-                   const hip_bfloat16* grad_O,
-                   const hip_bfloat16* attn_weights,
+template <typename T>
+void attn_backward(const T* Q,
+                   const T* K,
+                   const T* V,
+                   const T* grad_O,
+                   const T* attn_weights,
                    const uint8_t* mask,
-                   const hip_bfloat16* dropout_mask,
+                   const T* dropout_mask,
                    float dropout_p,
-                   hip_bfloat16* grad_Q,
-                   hip_bfloat16* grad_K,
-                   hip_bfloat16* grad_V,
+                   T* grad_Q,
+                   T* grad_K,
+                   T* grad_V,
                    int batch,
                    int head_num,
                    int q_seq,
@@ -375,19 +346,19 @@ void attn_backward(const hip_bfloat16* Q,
     float dropout_scale = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
 
     // Allocate temporary buffers
-    std::vector<hip_bfloat16> V_T(kv_seq * head_dim);
-    std::vector<hip_bfloat16> grad_attn(q_seq * kv_seq);
-    std::vector<hip_bfloat16> grad_scores(q_seq * kv_seq);
-    std::vector<hip_bfloat16> attn_T(kv_seq * q_seq);
-    std::vector<hip_bfloat16> grad_scores_T(kv_seq * q_seq);
-    std::vector<hip_bfloat16> row_sums(q_seq);
-    std::vector<hip_bfloat16> K_T(head_dim * kv_seq);
-    std::vector<hip_bfloat16> Q_T(head_dim * q_seq);
+    std::vector<T> V_T(kv_seq * head_dim);
+    std::vector<T> grad_attn(q_seq * kv_seq);
+    std::vector<T> grad_scores(q_seq * kv_seq);
+    std::vector<T> attn_T(kv_seq * q_seq);
+    std::vector<T> grad_scores_T(kv_seq * q_seq);
+    std::vector<T> row_sums(q_seq);
+    std::vector<T> K_T(head_dim * kv_seq);
+    std::vector<T> Q_T(head_dim * q_seq);
 
     // Initialize gradients to zero
-    std::memset(grad_Q, 0, batch * head_num * q_seq * head_dim * sizeof(hip_bfloat16));
-    std::memset(grad_K, 0, batch * head_num * kv_seq * head_dim * sizeof(hip_bfloat16));
-    std::memset(grad_V, 0, batch * head_num * kv_seq * head_dim * sizeof(hip_bfloat16));
+    std::memset(grad_Q, 0, batch * head_num * q_seq * head_dim * sizeof(T));
+    std::memset(grad_K, 0, batch * head_num * kv_seq * head_dim * sizeof(T));
+    std::memset(grad_V, 0, batch * head_num * kv_seq * head_dim * sizeof(T));
 
     // Process each batch and head
     for(int b = 0; b < batch; b++)
@@ -402,17 +373,17 @@ void attn_backward(const hip_bfloat16* Q,
             int offset_mask    = mask ? (b * head_num + h) * q_seq * kv_seq : 0;
             int offset_dropout = dropout_mask ? (b * head_num + h) * q_seq * kv_seq : 0;
 
-            const hip_bfloat16* Q_bh       = Q + offset_Q;
-            const hip_bfloat16* K_bh       = K + offset_K;
-            const hip_bfloat16* V_bh       = V + offset_V;
-            const hip_bfloat16* grad_O_bh  = grad_O + offset_grad_O;
-            const hip_bfloat16* attn_bh    = attn_weights + offset_attn;
-            const uint8_t* mask_bh         = mask ? mask + offset_mask : nullptr;
-            const hip_bfloat16* dropout_bh = dropout_mask ? dropout_mask + offset_dropout : nullptr;
+            const T* Q_bh          = Q + offset_Q;
+            const T* K_bh          = K + offset_K;
+            const T* V_bh          = V + offset_V;
+            const T* grad_O_bh     = grad_O + offset_grad_O;
+            const T* attn_bh       = attn_weights + offset_attn;
+            const uint8_t* mask_bh = mask ? mask + offset_mask : nullptr;
+            const T* dropout_bh    = dropout_mask ? dropout_mask + offset_dropout : nullptr;
 
-            hip_bfloat16* grad_Q_bh = grad_Q + offset_Q;
-            hip_bfloat16* grad_K_bh = grad_K + offset_K;
-            hip_bfloat16* grad_V_bh = grad_V + offset_V;
+            T* grad_Q_bh = grad_Q + offset_Q;
+            T* grad_K_bh = grad_K + offset_K;
+            T* grad_V_bh = grad_V + offset_V;
 
             // Step 1: grad_V = attn_weights^T @ grad_O
             // attn_weights: [q_seq, kv_seq], grad_O: [q_seq, head_dim] -> grad_V: [kv_seq,
@@ -430,8 +401,7 @@ void attn_backward(const hip_bfloat16* Q,
             {
                 for(int i = 0; i < q_seq * kv_seq; i++)
                 {
-                    grad_attn[i] =
-                        hip_bfloat16(float(grad_attn[i]) * float(dropout_bh[i]) * dropout_scale);
+                    grad_attn[i] = T(float(grad_attn[i]) * float(dropout_bh[i]) * dropout_scale);
                 }
             }
 
@@ -440,7 +410,7 @@ void attn_backward(const hip_bfloat16* Q,
             // attn_weights, dim=-1)
             for(int i = 0; i < q_seq * kv_seq; i++)
             {
-                grad_scores[i] = hip_bfloat16(float(grad_attn[i]) * float(attn_bh[i]));
+                grad_scores[i] = T(float(grad_attn[i]) * float(attn_bh[i]));
             }
 
             sum_last_dim(grad_scores.data(), row_sums.data(), q_seq, kv_seq);
@@ -449,9 +419,9 @@ void attn_backward(const hip_bfloat16* Q,
             {
                 for(int j = 0; j < kv_seq; j++)
                 {
-                    int idx          = i * kv_seq + j;
-                    grad_scores[idx] = hip_bfloat16(float(grad_scores[idx]) -
-                                                    float(attn_bh[idx]) * float(row_sums[i]));
+                    int idx = i * kv_seq + j;
+                    grad_scores[idx] =
+                        T(float(grad_scores[idx]) - float(attn_bh[idx]) * float(row_sums[i]));
                 }
             }
 
@@ -462,7 +432,7 @@ void attn_backward(const hip_bfloat16* Q,
                 {
                     if(mask_bh[i] == 0)
                     {
-                        grad_scores[i] = hip_bfloat16(0.0f);
+                        grad_scores[i] = T(0.0f);
                     }
                 }
             }
@@ -472,7 +442,7 @@ void attn_backward(const hip_bfloat16* Q,
             matmul(grad_scores.data(), K_bh, grad_Q_bh, q_seq, kv_seq, head_dim);
             for(int i = 0; i < q_seq * head_dim; i++)
             {
-                grad_Q_bh[i] = hip_bfloat16(float(grad_Q_bh[i]) * scale);
+                grad_Q_bh[i] = T(float(grad_Q_bh[i]) * scale);
             }
 
             // Step 7: grad_K = grad_scores^T @ Q / scale
@@ -481,7 +451,7 @@ void attn_backward(const hip_bfloat16* Q,
             matmul(grad_scores_T.data(), Q_bh, grad_K_bh, kv_seq, q_seq, head_dim);
             for(int i = 0; i < kv_seq * head_dim; i++)
             {
-                grad_K_bh[i] = hip_bfloat16(float(grad_K_bh[i]) * scale);
+                grad_K_bh[i] = T(float(grad_K_bh[i]) * scale);
             }
         }
     }
@@ -490,10 +460,10 @@ void attn_backward(const hip_bfloat16* Q,
 /**
  * Test run_attn_bwd_kernel correctness and bandwidth
  */
-template <typename Config>
-void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
+template <typename DataType, typename Config>
+void test_run_attn_bwd_kernel(
+    float dropout_p, int warmup_iters, int test_iters, bool check_correctness, bool dump_err)
 {
-    using DataType = hip_bfloat16;
     using Launcher = AttnBackwardKernelLauncher<DataType, Config>;
 
     constexpr int bs       = Config::bs;
@@ -532,13 +502,13 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
     for(size_t i = 0; i < size_Q; i++)
-        h_Q[i] = hip_bfloat16(dis(gen));
+        h_Q[i] = DataType(dis(gen));
     for(size_t i = 0; i < size_K; i++)
-        h_K[i] = hip_bfloat16(dis(gen));
+        h_K[i] = DataType(dis(gen));
     for(size_t i = 0; i < size_V; i++)
-        h_V[i] = hip_bfloat16(dis(gen));
+        h_V[i] = DataType(dis(gen));
     for(size_t i = 0; i < size_grad_O; i++)
-        h_grad_O[i] = hip_bfloat16(dis(gen));
+        h_grad_O[i] = DataType(dis(gen));
 
     // Initialize attention weights (normalized softmax output)
     for(int b = 0; b < bs; b++)
@@ -551,7 +521,7 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
                 for(int j = 0; j < seq_kv; j++)
                 {
                     int idx             = ((b * head_num + h) * seq_q + i) * seq_kv + j;
-                    h_attn_weights[idx] = hip_bfloat16(std::abs(dis(gen)));
+                    h_attn_weights[idx] = DataType(std::abs(dis(gen)));
                     sum += float(h_attn_weights[idx]);
                 }
                 if(sum > 0.0f)
@@ -559,7 +529,7 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
                     for(int j = 0; j < seq_kv; j++)
                     {
                         int idx             = ((b * head_num + h) * seq_q + i) * seq_kv + j;
-                        h_attn_weights[idx] = hip_bfloat16(float(h_attn_weights[idx]) / sum);
+                        h_attn_weights[idx] = DataType(float(h_attn_weights[idx]) / sum);
                     }
                 }
             }
@@ -576,8 +546,8 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
     for(size_t i = 0; i < size_dropout_mask; i++)
     {
         h_dropout_mask[i] = Config::enable_dropout_mask
-                                ? hip_bfloat16(dis(gen) > dropout_p ? 1.0f : 0.0f)
-                                : hip_bfloat16(1.0f);
+                                ? DataType(dis(gen) > dropout_p ? 1.0f : 0.0f)
+                                : DataType(1.0f);
     }
 
     // Compute CPU reference
@@ -692,10 +662,10 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
         hipMemcpy(h_grad_V_gpu.data(), d_grad_V, size_V * sizeof(DataType), hipMemcpyDeviceToHost));
 
     // Check correctness
-    auto check_results = [](const std::vector<DataType>& gpu,
-                            const std::vector<DataType>& cpu,
-                            const std::string& name,
-                            float tolerance = 1e-2) {
+    auto check_results = [&](const std::vector<DataType>& gpu,
+                             const std::vector<DataType>& cpu,
+                             const std::string& name,
+                             float tolerance = 1e-2) {
         float max_diff     = 0.0f;
         float max_rel_diff = 0.0f;
         size_t diff_count  = 0;
@@ -708,10 +678,12 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
             max_rel_diff   = std::max(max_rel_diff, rel_diff);
             if(rel_diff > tolerance)
             {
-                std::cout << name << " mismatch at index " << i
-                          << ": GPU=" << static_cast<float>(gpu[i])
-                          << ", CPU=" << static_cast<float>(cpu[i]) << ", abs_diff=" << diff
-                          << ", rel_diff=" << rel_diff << std::endl;
+                if(dump_err)
+                    std::cout << name << " mismatch at index " << i << ": GPU=" << std::fixed
+                              << std::setprecision(10) << static_cast<float>(gpu[i])
+                              << ", CPU=" << std::fixed << std::setprecision(10)
+                              << static_cast<float>(cpu[i]) << ", abs_diff=" << diff
+                              << ", rel_diff=" << rel_diff << std::endl;
                 diff_count++;
             }
         }
@@ -749,12 +721,14 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
     std::cout << "  Mask: " << (Config::enable_mask ? "enabled" : "disabled") << std::endl;
     std::cout << std::endl;
 
-    std::cout << "Correctness:" << std::endl;
-    check_results(h_grad_Q_gpu, h_grad_Q_cpu, "grad_Q");
-    check_results(h_grad_K_gpu, h_grad_K_cpu, "grad_K");
-    check_results(h_grad_V_gpu, h_grad_V_cpu, "grad_V");
-    std::cout << std::endl;
-
+    if(check_correctness)
+    {
+        std::cout << "Correctness:" << std::endl;
+        check_results(h_grad_Q_gpu, h_grad_Q_cpu, "grad_Q");
+        check_results(h_grad_K_gpu, h_grad_K_cpu, "grad_K");
+        check_results(h_grad_V_gpu, h_grad_V_cpu, "grad_V");
+        std::cout << std::endl;
+    }
     std::cout << "Memory:" << std::endl;
     std::cout << "  Total data read: " << std::fixed << std::setprecision(2) << bytes_read / 1e6
               << " MB" << std::endl;
@@ -786,29 +760,25 @@ void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
     HIP_CHECK(hipEventDestroy(stop));
 }
 
-/**
- * Simplified test entry function
- */
-template <typename Config>
-void run_attn_bwd_test(int warmup_iters = 0, int test_iters = 1, float dropout_p = 0.0f)
-{
-    std::cout << "Testing with mask and dropout:" << std::endl;
-    test_run_attn_bwd_kernel<Config>(dropout_p, warmup_iters, test_iters);
-}
-
 int main(int argc, char const* argv[])
 {
     // Create test configuration with all parameters in one place
-    // using KernelConfig1 = FmhaKernelConfig<16, 8, 2, 1, 256, 128, true, true>;
-    using KernelConfig2 = FmhaKernelConfig<16, 8, 1, 2, 256, 128, true, true>;
-    // using KernelConfig3 = FmhaKernelConfig<30720, 32, 2, 1, 128, 128, true, true>;
-    // using KernelConfig4 = FmhaKernelConfig<30720, 32, 1, 2, 128, 128, true, true>;
+    using KernelConfig1 = FmhaKernelConfig<30720, 16, 2, 1, 256, 128, true, true>;
+    using KernelConfig2 = FmhaKernelConfig<30720, 16, 1, 2, 256, 128, true, true>;
+    using KernelConfig3 = FmhaKernelConfig<30720, 32, 2, 1, 128, 128, true, true>;
+    using KernelConfig4 = FmhaKernelConfig<30720, 32, 1, 2, 128, 128, true, true>;
 
-    // Run test with specified warmup and test iterations
-    // run_attn_bwd_test<KernelConfig1>(0, 1, 0.3f);
-    run_attn_bwd_test<KernelConfig2>(0, 1, 0.3f);
-    // run_attn_bwd_test<KernelConfig3>(0, 1, 0.3f);
-    // run_attn_bwd_test<KernelConfig4>(0, 1, 0.3f);
+    // std::cout << "\n========== Testing with bfloat16 ==========" << std::endl;
+    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig1>(0.3, 0, 1, true, false);
+    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0.3, 0, 1, true, false);
+    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0.3, 0, 1, true, false);
+    // test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0.3, 0, 1, true, false);
+
+    std::cout << "\n========== Testing with float ==========" << std::endl;
+    test_run_attn_bwd_kernel<float, KernelConfig1>(0.3, 0, 1, true, false);
+    test_run_attn_bwd_kernel<float, KernelConfig2>(0.3, 0, 1, true, false);
+    test_run_attn_bwd_kernel<float, KernelConfig3>(0.3, 0, 1, true, false);
+    test_run_attn_bwd_kernel<float, KernelConfig4>(0.3, 0, 1, true, false);
 
     return 0;
 }
