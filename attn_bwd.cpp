@@ -26,35 +26,36 @@
         }                                                                                  \
     } while(0)
 
-template <int BS, int HEAD_NUM, int SEQ_Q, int SEQ_KV, int HEAD_DIM>
-struct fmha_kernel_config
+template <int BS,
+          int HEAD_NUM,
+          int SEQ_Q,
+          int SEQ_KV,
+          int HEAD_DIM,
+          int STEP2_BLOCK_SIZE     = 256,
+          bool ENABLE_DROPOUT_MASK = true,
+          bool ENABLE_MASK         = true>
+struct FmhaKernelConfig
 {
-    static constexpr int bs       = BS;
-    static constexpr int head_num = HEAD_NUM;
-    static constexpr int seq_q    = SEQ_Q;
-    static constexpr int seq_kv   = SEQ_KV;
-    static constexpr int head_dim = HEAD_DIM;
+    static constexpr int bs                   = BS;
+    static constexpr int head_num             = HEAD_NUM;
+    static constexpr int seq_q                = SEQ_Q;
+    static constexpr int seq_kv               = SEQ_KV;
+    static constexpr int head_dim             = HEAD_DIM;
+    static constexpr int step2_block_size     = STEP2_BLOCK_SIZE;
+    static constexpr bool enable_dropout_mask = ENABLE_DROPOUT_MASK;
+    static constexpr bool enable_mask         = ENABLE_MASK;
 };
 
-template <int step2_block_size_ = 256, bool enable_dropout_mask_ = true, bool enable_mask_ = true>
-struct fmha_kernel_parallel_policy
+template <typename T, typename Config>
+__global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
+                                                    const T* grad_O,
+                                                    const T* V,
+                                                    T* grad_V,
+                                                    T* workspace) // store grad_attn
 {
-
-    static constexpr int step2_block_size     = step2_block_size_;
-    static constexpr bool enable_dropout_mask = enable_dropout_mask_;
-    static constexpr bool enable_mask         = enable_mask_;
-};
-
-template <typename T, typename shape_config>
-__global__ void kernel1(const T* attn_weights,
-                        const T* grad_O,
-                        const T* V,
-                        T* grad_V,
-                        T* workspace) // store grad_attn
-{
-    constexpr int seq_q    = shape_config::seq_q;
-    constexpr int seq_kv   = shape_config::seq_kv;
-    constexpr int head_dim = shape_config::head_dim;
+    constexpr int seq_q    = Config::seq_q;
+    constexpr int seq_kv   = Config::seq_kv;
+    constexpr int head_dim = Config::head_dim;
 
     const uint32_t block_id  = blockIdx.x;
     const uint32_t thread_id = threadIdx.x;
@@ -122,40 +123,34 @@ __global__ void kernel1(const T* attn_weights,
     }
 }
 
-template <typename T, typename mask_type, typename shape_config, typename parallel_policy>
-__global__ void kernel2(const T* attn_weights,
-                        const T* dropout_mask,
-                        const mask_type* mask,
-                        T* grad_attn,
-                        float dropout_scale)
+template <typename T, typename mask_type, typename Config>
+__global__ void apply_softmax_backward_kernel(const T* attn_weights,
+                                              const T* dropout_mask,
+                                              const mask_type* mask,
+                                              T* grad_attn,
+                                              float dropout_scale)
 {
     const uint32_t block_id        = blockIdx.x;
     const uint32_t thread_id       = threadIdx.x;
-    constexpr int seq_q            = shape_config::seq_q;
-    constexpr int seq_kv           = shape_config::seq_kv;
-    constexpr int bs_num_per_block = parallel_policy::step2_block_size;
-    static_assert(bs_num_per_block / (seq_kv * seq_kv) > 0 &&
+    constexpr int seq_q            = Config::seq_q;
+    constexpr int seq_kv           = Config::seq_kv;
+    constexpr int bs_num_per_block = Config::step2_block_size;
+    static_assert(bs_num_per_block / (seq_kv * seq_q) > 0 &&
                       bs_num_per_block % (seq_q * seq_kv) == 0,
                   "wrong!");
     const uint32_t cur_block_offset = block_id * bs_num_per_block + thread_id;
     __shared__ T tmp_grad_score[bs_num_per_block];
     constexpr int reduce_score_num = bs_num_per_block / seq_kv;
-    __shared__ T reduce_grad_scorep[reduce_score_num];
+    __shared__ T reduce_grad_score[reduce_score_num];
     constexpr int loop_num = bs_num_per_block / (seq_q * seq_kv);
 
     T grad_attn_value = grad_attn[cur_block_offset];
-    if constexpr(parallel_policy::enable_dropout_mask)
+    if constexpr(Config::enable_dropout_mask)
     {
         grad_attn_value = grad_attn_value * dropout_mask[cur_block_offset] * dropout_scale;
     }
-    T attn_weight = attn_weights[cur_block_offset];
-    T grad_score  = grad_attn_value * attn_weight;
-    if constexpr(parallel_policy::enable_mask)
-    {
-        mask_type cur_thread_mask = mask[cur_block_offset];
-        if(cur_thread_mask)
-            grad_score = T(0.0f);
-    }
+    T attn_weight             = attn_weights[cur_block_offset];
+    T grad_score              = grad_attn_value * attn_weight;
     tmp_grad_score[thread_id] = grad_score;
     __syncthreads();
     // reduce within block
@@ -167,22 +162,40 @@ __global__ void kernel2(const T* attn_weights,
         {
             sum += tmp_grad_score[thread_id * seq_kv + i];
         }
-        reduce_grad_scorep[thread_id] = sum;
+        reduce_grad_score[thread_id] = sum;
     }
     __syncthreads();
-    grad_score -= attn_weight * reduce_grad_scorep[thread_id / seq_kv];
+    // if(thread_id < reduce_score_num)
+    //     printf("thread_id=%d, reduce_grad_score_value=%f\n",
+    //            thread_id,
+    //            static_cast<float>(reduce_grad_score[thread_id]));
+    grad_score -= attn_weight * reduce_grad_score[thread_id / seq_kv];
+    if constexpr(Config::enable_mask)
+    {
+        mask_type cur_thread_mask = mask[cur_block_offset];
+        // printf("block_id=%d, thread_id=%d, mask_value=%d\n", block_id, thread_id,
+        // cur_thread_mask);
+        if(cur_thread_mask == 0)
+        {
+            grad_score = T(0.0f);
+        }
+    }
+    // printf("block_id=%d, thread_id=%d, before dropout, grad_score=%f\n",
+    //        block_id,
+    //        thread_id,
+    //        static_cast<float>(grad_score));
     grad_attn[cur_block_offset] = grad_score;
 }
 
-template <typename T, typename shape_config>
-__global__ void
-kernel3(const T* grad_scores, const T* Q, const T* K, T* grad_Q, T* grad_K, float scale)
+template <typename T, typename Config>
+__global__ void compute_grad_q_and_grad_k_kernel(
+    const T* grad_scores, const T* Q, const T* K, T* grad_Q, T* grad_K, float scale)
 {
     const uint32_t block_id  = blockIdx.x;
     const uint32_t thread_id = threadIdx.x;
-    constexpr int seq_q      = shape_config::seq_q;
-    constexpr int seq_kv     = shape_config::seq_kv;
-    constexpr int head_dim   = shape_config::head_dim;
+    constexpr int seq_q      = Config::seq_q;
+    constexpr int seq_kv     = Config::seq_kv;
+    constexpr int head_dim   = Config::head_dim;
 
     const T* grad_scores_ptr = grad_scores + block_id * seq_q * seq_kv;
     const T* Q_ptr           = Q + block_id * seq_q * head_dim;
@@ -215,16 +228,16 @@ kernel3(const T* grad_scores, const T* Q, const T* K, T* grad_Q, T* grad_K, floa
     }
 }
 
-template <typename T, typename shape_config, typename parallel_policy>
-struct attn_backward_kernel_launcher
+template <typename T, typename Config>
+struct AttnBackwardKernelLauncher
 {
 
     static size_t calc_workspace_size()
     {
-        constexpr int bs       = shape_config::bs;
-        constexpr int head_num = shape_config::head_num;
-        constexpr int seq_q    = shape_config::seq_q;
-        constexpr int seq_kv   = shape_config::seq_kv;
+        constexpr int bs       = Config::bs;
+        constexpr int head_num = Config::head_num;
+        constexpr int seq_q    = Config::seq_q;
+        constexpr int seq_kv   = Config::seq_kv;
 
         size_t workspace_size = bs * head_num * seq_q * seq_kv * sizeof(T);
         return workspace_size;
@@ -235,7 +248,7 @@ struct attn_backward_kernel_launcher
                                     const T* V,
                                     const T* grad_O,
                                     const T* attn_weights,
-                                    const T* mask,
+                                    const uint8_t* mask,
                                     const T* dropout_mask,
                                     float dropout_p,
                                     float sqr_dk_scale,
@@ -244,31 +257,30 @@ struct attn_backward_kernel_launcher
                                     T* grad_V,
                                     T* workspace)
     {
-        constexpr int bs       = shape_config::bs;
-        constexpr int head_num = shape_config::head_num;
-        constexpr int seq_q    = shape_config::seq_q;
-        constexpr int seq_kv   = shape_config::seq_kv;
-        constexpr int head_dim = shape_config::head_dim;
+        constexpr int bs       = Config::bs;
+        constexpr int head_num = Config::head_num;
+        constexpr int seq_q    = Config::seq_q;
+        constexpr int seq_kv   = Config::seq_kv;
+        constexpr int head_dim = Config::head_dim;
 
-        int merge_bs        = bs * head_num;
-        float scale         = sqr_dk_scale;
-        float dropout_scale = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
+        constexpr int merge_bs = bs * head_num;
+        float scale            = sqr_dk_scale;
+        float dropout_scale    = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
 
         dim3 grid(merge_bs);
         dim3 block(head_dim);
 
-        kernel1<T, shape_config><<<grid, block>>>(attn_weights, grad_O, V, grad_V, workspace);
+        compute_grad_v_and_grad_attn_kernel<T, Config>
+            <<<grid, block>>>(attn_weights, grad_O, V, grad_V, workspace);
 
-        dim3 grid2(merge_bs * seq_q * seq_kv / parallel_policy::step2_block_size);
-        dim3 block2(parallel_policy::step2_block_size);
-        kernel2<T, uint8_t, shape_config, parallel_policy>
-            <<<grid2, block2>>>(attn_weights,
-                                dropout_mask,
-                                reinterpret_cast<const uint8_t*>(mask),
-                                workspace,
-                                dropout_scale);
+        static_assert(merge_bs * seq_q * seq_kv / Config::step2_block_size > 0);
+        dim3 grid2(merge_bs * seq_q * seq_kv / Config::step2_block_size);
+        dim3 block2(Config::step2_block_size);
+        apply_softmax_backward_kernel<T, uint8_t, Config>
+            <<<grid2, block2>>>(attn_weights, dropout_mask, mask, workspace, dropout_scale);
 
-        kernel3<T, shape_config><<<grid, block>>>(workspace, Q, K, grad_Q, grad_K, scale);
+        compute_grad_q_and_grad_k_kernel<T, Config>
+            <<<grid, block>>>(workspace, Q, K, grad_Q, grad_K, scale);
     }
 };
 // Helper function: Matrix multiplication C = A @ B
@@ -328,9 +340,9 @@ void sum_last_dim(const hip_bfloat16* A, hip_bfloat16* sums, int rows, int cols)
  * @param V: Value tensor [batch, head_num, kv_seq, head_dim]
  * @param grad_O: Gradient of output [batch, head_num, q_seq, head_dim]
  * @param attn_weights: Attention weights from forward pass [batch, head_num, q_seq, kv_seq]
- * @param mask: Optional mask [batch, head_num, q_seq, kv_seq] (nullptr if not used)
+ * @param mask: Optional mask [batch, head_num, q_seq, kv_seq] (nullptr if not used), uint8_t type
  * @param dropout_mask: Optional dropout mask [batch, head_num, q_seq, kv_seq] (nullptr if not
- * used)
+ * used), hip_bfloat16 type (0.0 or 1.0)
  * @param dropout_p: Dropout probability
  * @param grad_Q: Output gradient for Q [batch, head_num, q_seq, head_dim]
  * @param grad_K: Output gradient for K [batch, head_num, kv_seq, head_dim]
@@ -346,7 +358,7 @@ void attn_backward(const hip_bfloat16* Q,
                    const hip_bfloat16* V,
                    const hip_bfloat16* grad_O,
                    const hip_bfloat16* attn_weights,
-                   const hip_bfloat16* mask,
+                   const uint8_t* mask,
                    const hip_bfloat16* dropout_mask,
                    float dropout_p,
                    hip_bfloat16* grad_Q,
@@ -395,7 +407,7 @@ void attn_backward(const hip_bfloat16* Q,
             const hip_bfloat16* V_bh       = V + offset_V;
             const hip_bfloat16* grad_O_bh  = grad_O + offset_grad_O;
             const hip_bfloat16* attn_bh    = attn_weights + offset_attn;
-            const hip_bfloat16* mask_bh    = mask ? mask + offset_mask : nullptr;
+            const uint8_t* mask_bh         = mask ? mask + offset_mask : nullptr;
             const hip_bfloat16* dropout_bh = dropout_mask ? dropout_mask + offset_dropout : nullptr;
 
             hip_bfloat16* grad_Q_bh = grad_Q + offset_Q;
@@ -448,7 +460,7 @@ void attn_backward(const hip_bfloat16* Q,
             {
                 for(int i = 0; i < q_seq * kv_seq; i++)
                 {
-                    if(float(mask_bh[i]) == 0.0f)
+                    if(mask_bh[i] == 0)
                     {
                         grad_scores[i] = hip_bfloat16(0.0f);
                     }
@@ -476,56 +488,13 @@ void attn_backward(const hip_bfloat16* Q,
 }
 
 /**
- * Test configuration structure
- */
-struct AttnTestConfig
-{
-    int batch;
-    int head_num;
-    int q_seq;
-    int kv_seq;
-    int head_dim;
-    float dropout_p;
-    int warmup_iters;
-    int test_iters;
-
-    AttnTestConfig(int b      = 2,
-                   int h      = 8,
-                   int q      = 1,
-                   int kv     = 2,
-                   int d      = 64,
-                   float dp   = 0.0f,
-                   int warmup = 1,
-                   int test   = 1)
-        : batch(b),
-          head_num(h),
-          q_seq(q),
-          kv_seq(kv),
-          head_dim(d),
-          dropout_p(dp),
-          warmup_iters(warmup),
-          test_iters(test)
-    {
-    }
-};
-
-/**
  * Test run_attn_bwd_kernel correctness and bandwidth
  */
-template <typename Config, typename ParallelPolicy>
-void test_run_attn_bwd_kernel(const AttnTestConfig& config)
+template <typename Config>
+void test_run_attn_bwd_kernel(float dropout_p, int warmup_iters, int test_iters)
 {
     using DataType = hip_bfloat16;
-    using Launcher = attn_backward_kernel_launcher<DataType, Config, ParallelPolicy>;
-
-    // Validate config matches template parameters
-    if(config.batch != Config::bs || config.head_num != Config::head_num ||
-       config.q_seq != Config::seq_q || config.kv_seq != Config::seq_kv ||
-       config.head_dim != Config::head_dim)
-    {
-        std::cerr << "Error: Config mismatch with template parameters!" << std::endl;
-        return;
-    }
+    using Launcher = AttnBackwardKernelLauncher<DataType, Config>;
 
     constexpr int bs       = Config::bs;
     constexpr int head_num = Config::head_num;
@@ -548,7 +517,7 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
     std::vector<DataType> h_V(size_V);
     std::vector<DataType> h_grad_O(size_grad_O);
     std::vector<DataType> h_attn_weights(size_attn_weights);
-    std::vector<DataType> h_mask(size_mask);
+    std::vector<uint8_t> h_mask(size_mask);
     std::vector<DataType> h_dropout_mask(size_dropout_mask);
     std::vector<DataType> h_grad_Q_gpu(size_Q);
     std::vector<DataType> h_grad_K_gpu(size_K);
@@ -600,15 +569,14 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
     // Initialize mask (1 = keep, 0 = mask out)
     for(size_t i = 0; i < size_mask; i++)
     {
-        h_mask[i] = ParallelPolicy::enable_mask ? hip_bfloat16(dis(gen) > 0.0f ? 1.0f : 0.0f)
-                                                : hip_bfloat16(1.0f);
+        h_mask[i] = Config::enable_mask ? (dis(gen) > 0.0f ? 1 : 0) : 1;
     }
 
     // Initialize dropout mask (1 = keep, 0 = drop)
     for(size_t i = 0; i < size_dropout_mask; i++)
     {
-        h_dropout_mask[i] = ParallelPolicy::enable_dropout_mask
-                                ? hip_bfloat16(dis(gen) > config.dropout_p ? 1.0f : 0.0f)
+        h_dropout_mask[i] = Config::enable_dropout_mask
+                                ? hip_bfloat16(dis(gen) > dropout_p ? 1.0f : 0.0f)
                                 : hip_bfloat16(1.0f);
     }
 
@@ -619,9 +587,9 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
                   h_V.data(),
                   h_grad_O.data(),
                   h_attn_weights.data(),
-                  ParallelPolicy::enable_mask ? h_mask.data() : nullptr,
-                  ParallelPolicy::enable_dropout_mask ? h_dropout_mask.data() : nullptr,
-                  config.dropout_p,
+                  Config::enable_mask ? h_mask.data() : nullptr,
+                  Config::enable_dropout_mask ? h_dropout_mask.data() : nullptr,
+                  dropout_p,
                   h_grad_Q_cpu.data(),
                   h_grad_K_cpu.data(),
                   h_grad_V_cpu.data(),
@@ -633,7 +601,8 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
 
     // Allocate device memory
     DataType *d_Q, *d_K, *d_V, *d_grad_O, *d_attn_weights;
-    DataType *d_mask, *d_dropout_mask;
+    uint8_t* d_mask;
+    DataType* d_dropout_mask;
     DataType *d_grad_Q, *d_grad_K, *d_grad_V, *d_workspace;
 
     HIP_CHECK(hipMalloc(&d_Q, size_Q * sizeof(DataType)));
@@ -641,7 +610,7 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
     HIP_CHECK(hipMalloc(&d_V, size_V * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_grad_O, size_grad_O * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_attn_weights, size_attn_weights * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_mask, size_mask * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_mask, size_mask * sizeof(uint8_t)));
     HIP_CHECK(hipMalloc(&d_dropout_mask, size_dropout_mask * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_grad_Q, size_Q * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_grad_K, size_K * sizeof(DataType)));
@@ -660,25 +629,23 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
                         h_attn_weights.data(),
                         size_attn_weights * sizeof(DataType),
                         hipMemcpyHostToDevice));
-    HIP_CHECK(
-        hipMemcpy(d_mask, h_mask.data(), size_mask * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_mask, h_mask.data(), size_mask * sizeof(uint8_t), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_dropout_mask,
                         h_dropout_mask.data(),
                         size_dropout_mask * sizeof(DataType),
                         hipMemcpyHostToDevice));
 
     // Warmup runs
-    for(int i = 0; i < config.warmup_iters; i++)
+    for(int i = 0; i < warmup_iters; i++)
     {
         Launcher::run_attn_bwd_kernel(d_Q,
                                       d_K,
                                       d_V,
                                       d_grad_O,
                                       d_attn_weights,
-                                      ParallelPolicy::enable_mask ? d_mask : nullptr,
-                                      ParallelPolicy::enable_dropout_mask ? d_dropout_mask
-                                                                          : nullptr,
-                                      config.dropout_p,
+                                      Config::enable_mask ? d_mask : nullptr,
+                                      Config::enable_dropout_mask ? d_dropout_mask : nullptr,
+                                      dropout_p,
                                       sqr_dk_scale,
                                       d_grad_Q,
                                       d_grad_K,
@@ -693,17 +660,16 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
     HIP_CHECK(hipEventCreate(&stop));
 
     HIP_CHECK(hipEventRecord(start));
-    for(int i = 0; i < config.test_iters; i++)
+    for(int i = 0; i < test_iters; i++)
     {
         Launcher::run_attn_bwd_kernel(d_Q,
                                       d_K,
                                       d_V,
                                       d_grad_O,
                                       d_attn_weights,
-                                      ParallelPolicy::enable_mask ? d_mask : nullptr,
-                                      ParallelPolicy::enable_dropout_mask ? d_dropout_mask
-                                                                          : nullptr,
-                                      config.dropout_p,
+                                      Config::enable_mask ? d_mask : nullptr,
+                                      Config::enable_dropout_mask ? d_dropout_mask : nullptr,
+                                      dropout_p,
                                       sqr_dk_scale,
                                       d_grad_Q,
                                       d_grad_K,
@@ -715,7 +681,7 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
 
     float elapsed_ms = 0;
     HIP_CHECK(hipEventElapsedTime(&elapsed_ms, start, stop));
-    double avg_time_ms = elapsed_ms / config.test_iters;
+    double avg_time_ms = elapsed_ms / test_iters;
 
     // Copy results back
     HIP_CHECK(
@@ -742,6 +708,10 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
             max_rel_diff   = std::max(max_rel_diff, rel_diff);
             if(rel_diff > tolerance)
             {
+                std::cout << name << " mismatch at index " << i
+                          << ": GPU=" << static_cast<float>(gpu[i])
+                          << ", CPU=" << static_cast<float>(cpu[i]) << ", abs_diff=" << diff
+                          << ", rel_diff=" << rel_diff << std::endl;
                 diff_count++;
             }
         }
@@ -757,14 +727,13 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
     // Calculate bandwidth
     size_t bytes_read =
         (size_Q + size_K + size_V + size_grad_O + size_attn_weights) * sizeof(DataType);
-    if(ParallelPolicy::enable_mask)
+    if(Config::enable_mask)
         bytes_read += size_mask * sizeof(DataType);
-    if(ParallelPolicy::enable_dropout_mask)
+    if(Config::enable_dropout_mask)
         bytes_read += size_dropout_mask * sizeof(DataType);
 
-    size_t bytes_write = (size_Q + size_K + size_V) * sizeof(DataType);
-    size_t total_bytes = bytes_read + bytes_write;
-    std::cout << "~~~~~~~~~~~" << total_bytes << std::endl;
+    size_t bytes_write    = (size_Q + size_K + size_V) * sizeof(DataType);
+    size_t total_bytes    = bytes_read + bytes_write;
     double bandwidth_gbps = (total_bytes / 1e9) / (avg_time_ms / 1000.0);
 
     // Print results
@@ -775,9 +744,9 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
     std::cout << "  Q sequence length: " << seq_q << std::endl;
     std::cout << "  KV sequence length: " << seq_kv << std::endl;
     std::cout << "  Head dimension: " << head_dim << std::endl;
-    std::cout << "  Dropout: " << (ParallelPolicy::enable_dropout_mask ? "enabled" : "disabled")
+    std::cout << "  Dropout: " << (Config::enable_dropout_mask ? "enabled" : "disabled")
               << std::endl;
-    std::cout << "  Mask: " << (ParallelPolicy::enable_mask ? "enabled" : "disabled") << std::endl;
+    std::cout << "  Mask: " << (Config::enable_mask ? "enabled" : "disabled") << std::endl;
     std::cout << std::endl;
 
     std::cout << "Correctness:" << std::endl;
@@ -817,17 +786,29 @@ void test_run_attn_bwd_kernel(const AttnTestConfig& config)
     HIP_CHECK(hipEventDestroy(stop));
 }
 
+/**
+ * Simplified test entry function
+ */
+template <typename Config>
+void run_attn_bwd_test(int warmup_iters = 0, int test_iters = 1, float dropout_p = 0.0f)
+{
+    std::cout << "Testing with mask and dropout:" << std::endl;
+    test_run_attn_bwd_kernel<Config>(dropout_p, warmup_iters, test_iters);
+}
+
 int main(int argc, char const* argv[])
 {
-    // Create test configuration
-    using KernelConfig   = fmha_kernel_config<30720, 16, 2, 1, 256>;
-    using ParallelPolicy = fmha_kernel_parallel_policy<256, true, true>;
+    // Create test configuration with all parameters in one place
+    // using KernelConfig1 = FmhaKernelConfig<16, 8, 2, 1, 256, 128, true, true>;
+    using KernelConfig2 = FmhaKernelConfig<16, 8, 1, 2, 256, 128, true, true>;
+    // using KernelConfig3 = FmhaKernelConfig<30720, 32, 2, 1, 128, 128, true, true>;
+    // using KernelConfig4 = FmhaKernelConfig<30720, 32, 1, 2, 128, 128, true, true>;
 
-    AttnTestConfig config(30720, 16, 2, 1, 256, 0.0f, 0, 1);
-
-    // Test without mask and dropout
-    std::cout << "Testing with mask and dropout:" << std::endl;
-    test_run_attn_bwd_kernel<KernelConfig, ParallelPolicy>(config);
+    // Run test with specified warmup and test iterations
+    // run_attn_bwd_test<KernelConfig1>(0, 1, 0.3f);
+    run_attn_bwd_test<KernelConfig2>(0, 1, 0.3f);
+    // run_attn_bwd_test<KernelConfig3>(0, 1, 0.3f);
+    // run_attn_bwd_test<KernelConfig4>(0, 1, 0.3f);
 
     return 0;
 }
