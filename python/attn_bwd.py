@@ -37,7 +37,6 @@ def mha_backward(
     mask: [B, H, N, M] or None
     dropout_p: float
     dropout_mask: [B, H, N, M] or None
-    返回: grad_Q, grad_K, grad_V
     """
     d_k = Q.size(-1)
     # grad w.r.t. V
@@ -49,9 +48,9 @@ def mha_backward(
         grad_attn = grad_attn * dropout_mask / (1 - dropout_p)
     # softmax backward
     # Let y = softmax(x), dy/dx = diag(y) - y y^T
-    # grad_x = (grad_y * y) - sum(grad_y * y) * y
+    # grad_x = y * (grad_y - sum(y * grad_y))
     grad_scores = grad_attn * attn_weights
-    grad_scores = grad_scores - attn_weights * grad_attn.sum(dim=-1, keepdim=True)
+    grad_scores = grad_scores - attn_weights * grad_scores.sum(dim=-1, keepdim=True)
     # mask backward
     if mask is not None:
         grad_scores = grad_scores.masked_fill(mask == 0, 0.0)
