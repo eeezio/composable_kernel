@@ -12,7 +12,7 @@
 #include <iomanip>
 
 // clang-format off
-// /opt/rocm/llvm/bin/clang++ -O3 -x hip --save-temps --offload-arch=gfx950 -o test-f8f4 test-f8f4.cpp && ./test-f8f4
+// /opt/rocm/llvm/bin/clang++ -O3 -x hip --offload-arch=gfx950 -o attn_bwd attn_bwd.cpp && ./attn_bwd
 // clang-format on
 
 #define HIP_CHECK(call)                                                                    \
