@@ -169,61 +169,66 @@ __global__ void apply_softmax_backward_kernel(const T* attn_weights,
                                               T* grad_attn,
                                               float dropout_scale)
 {
-    const uint32_t block_id        = blockIdx.x;
-    const uint32_t thread_id       = threadIdx.x;
-    constexpr int seq_q            = Config::seq_q;
-    constexpr int seq_kv           = Config::seq_kv;
-    constexpr int bs_num_per_block = Config::step2_block_size;
-    static_assert(bs_num_per_block / (seq_kv * seq_q) > 0 &&
-                      bs_num_per_block % (seq_q * seq_kv) == 0,
-                  "wrong!");
-    const uint32_t cur_block_offset = block_id * bs_num_per_block + thread_id;
-    __shared__ T tmp_grad_score[bs_num_per_block];
-    constexpr int reduce_score_num = bs_num_per_block / seq_kv;
-    __shared__ T reduce_grad_score[reduce_score_num];
-    constexpr int loop_num = bs_num_per_block / (seq_q * seq_kv);
+    const uint32_t block_id          = blockIdx.x;
+    const uint32_t thread_id         = threadIdx.x;
+    constexpr int seq_q              = Config::seq_q;
+    constexpr int seq_kv             = Config::seq_kv;
+    constexpr int block_size         = Config::step2_block_size;
+    constexpr int per_grad_attn_size = seq_q * seq_kv;
+    constexpr int valid_thread_range = block_size / per_grad_attn_size * per_grad_attn_size;
+    const uint32_t cur_block_offset  = block_id * valid_thread_range + thread_id;
+    constexpr uint32_t total_elt     = Config::bs * Config::head_num * seq_q * seq_kv;
+    bool is_tail                     = block_id * valid_thread_range + block_size >= total_elt;
+    int real_reduce_score_num = is_tail ? (total_elt - block_id * valid_thread_range) / seq_kv
+                                        : valid_thread_range / seq_kv;
+    if(cur_block_offset < total_elt && thread_id < valid_thread_range)
+    {
+        __shared__ T tmp_grad_score[valid_thread_range];
+        constexpr int reduce_score_num = valid_thread_range / seq_kv;
+        __shared__ T reduce_grad_score[reduce_score_num];
 
-    T grad_attn_value = grad_attn[cur_block_offset];
-    if constexpr(Config::enable_dropout_mask)
-    {
-        grad_attn_value = grad_attn_value * dropout_mask[cur_block_offset] * dropout_scale;
-    }
-    T attn_weight             = attn_weights[cur_block_offset];
-    T grad_score              = grad_attn_value * attn_weight;
-    tmp_grad_score[thread_id] = grad_score;
-    __syncthreads();
-    // reduce within block
-    if(thread_id < reduce_score_num)
-    {
-        T sum = T(0.0f);
+        T grad_attn_value = grad_attn[cur_block_offset];
+        if constexpr(Config::enable_dropout_mask)
+        {
+            grad_attn_value = grad_attn_value * dropout_mask[cur_block_offset] * dropout_scale;
+        }
+        T attn_weight             = attn_weights[cur_block_offset];
+        T grad_score              = grad_attn_value * attn_weight;
+        tmp_grad_score[thread_id] = grad_score;
+        __syncthreads();
+        // reduce within block
+        if(thread_id < real_reduce_score_num)
+        {
+            T sum = T(0.0f);
 #pragma unroll
-        for(int i = 0; i < seq_kv; i++)
-        {
-            sum += tmp_grad_score[thread_id * seq_kv + i];
+            for(int i = 0; i < seq_kv; i++)
+            {
+                sum += tmp_grad_score[thread_id * seq_kv + i];
+            }
+            reduce_grad_score[thread_id] = sum;
         }
-        reduce_grad_score[thread_id] = sum;
-    }
-    __syncthreads();
-    grad_score -= attn_weight * reduce_grad_score[thread_id / seq_kv];
-    if constexpr(Config::mask_type == CausalMaskType::TOP_LEFT)
-    {
-        int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
-        int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
-        if(k_idx > q_idx)
+        __syncthreads();
+        grad_score -= attn_weight * reduce_grad_score[thread_id / seq_kv];
+        if constexpr(Config::mask_type == CausalMaskType::TOP_LEFT)
         {
-            grad_score = T(0.0f);
+            int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
+            int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
+            if(k_idx > q_idx)
+            {
+                grad_score = T(0.0f);
+            }
         }
-    }
-    else if constexpr(Config::mask_type == CausalMaskType::BOTTOM_RIGHT)
-    {
-        int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
-        int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
-        if(k_idx < q_idx)
+        else if constexpr(Config::mask_type == CausalMaskType::BOTTOM_RIGHT)
         {
-            grad_score = T(0.0f);
+            int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
+            int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
+            if(k_idx < q_idx)
+            {
+                grad_score = T(0.0f);
+            }
         }
+        grad_attn[cur_block_offset] = grad_score;
     }
-    grad_attn[cur_block_offset] = grad_score;
 }
 
 template <typename T, typename Config>
@@ -345,8 +350,9 @@ struct AttnBackwardKernelLauncher
         compute_grad_v_and_grad_attn_kernel<T, Config>
             <<<grid, block>>>(attn_weights, grad_O, V, grad_V, workspace);
 
-        static_assert(merge_bs * seq_q * seq_kv / Config::step2_block_size > 0);
-        dim3 grid2(merge_bs * seq_q * seq_kv / Config::step2_block_size);
+        constexpr int work_thread_num =
+            Config::step2_block_size / (seq_q * seq_kv) * (seq_q * seq_kv);
+        dim3 grid2((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
         dim3 block2(Config::step2_block_size);
         apply_softmax_backward_kernel<T, Config>
             <<<grid2, block2>>>(attn_weights, dropout_mask, workspace, dropout_scale);
@@ -854,29 +860,88 @@ void test_run_attn_bwd_kernel(
     HIP_CHECK(hipEventDestroy(stop));
 }
 
+// Template metaprogramming: recursive template to iterate over SEQ_KV values
+template <int SEQ_KV, int MAX_SEQ_KV>
+struct TestRunner
+{
+    template <typename DataType,
+              int BS,
+              int HEAD_NUM,
+              int SEQ_Q,
+              int HEAD_DIM,
+              int STEP2_BLOCK_SIZE,
+              bool ENABLE_DROPOUT_MASK,
+              CausalMaskType MASK_TYPE>
+    static void
+    run(float dropout_p, int warmup_iters, int test_iters, bool check_correctness, bool dump_err)
+    {
+        using KernelConfig = FmhaKernelConfig<BS,
+                                              HEAD_NUM,
+                                              SEQ_Q,
+                                              SEQ_KV,
+                                              HEAD_DIM,
+                                              STEP2_BLOCK_SIZE,
+                                              ENABLE_DROPOUT_MASK,
+                                              MASK_TYPE>;
+        test_run_attn_bwd_kernel<DataType, KernelConfig>(
+            dropout_p, warmup_iters, test_iters, check_correctness, dump_err);
+
+        // Recursive call for next SEQ_KV value
+        TestRunner<SEQ_KV + 1, MAX_SEQ_KV>::template run<DataType,
+                                                         BS,
+                                                         HEAD_NUM,
+                                                         SEQ_Q,
+                                                         HEAD_DIM,
+                                                         STEP2_BLOCK_SIZE,
+                                                         ENABLE_DROPOUT_MASK,
+                                                         MASK_TYPE>(
+            dropout_p, warmup_iters, test_iters, check_correctness, dump_err);
+    }
+};
+
+// Termination condition: when SEQ_KV reaches MAX_SEQ_KV
+template <int MAX_SEQ_KV>
+struct TestRunner<MAX_SEQ_KV, MAX_SEQ_KV>
+{
+    template <typename DataType,
+              int BS,
+              int HEAD_NUM,
+              int SEQ_Q,
+              int HEAD_DIM,
+              int STEP2_BLOCK_SIZE,
+              bool ENABLE_DROPOUT_MASK,
+              CausalMaskType MASK_TYPE>
+    static void
+    run(float dropout_p, int warmup_iters, int test_iters, bool check_correctness, bool dump_err)
+    {
+        using KernelConfig = FmhaKernelConfig<BS,
+                                              HEAD_NUM,
+                                              SEQ_Q,
+                                              MAX_SEQ_KV,
+                                              HEAD_DIM,
+                                              STEP2_BLOCK_SIZE,
+                                              ENABLE_DROPOUT_MASK,
+                                              MASK_TYPE>;
+        test_run_attn_bwd_kernel<DataType, KernelConfig>(
+            dropout_p, warmup_iters, test_iters, check_correctness, dump_err);
+    }
+};
+
 int main(int argc, char const* argv[])
 {
-    // Create test configuration with all parameters in one place
-    using KernelConfig1 =
-        FmhaKernelConfig<30720, 16, 4, 1, 256, 128, false, CausalMaskType::TOP_LEFT>;
-    using KernelConfig2 =
-        FmhaKernelConfig<30720, 16, 1, 4, 256, 128, false, CausalMaskType::TOP_LEFT>;
-    using KernelConfig3 =
-        FmhaKernelConfig<30720, 32, 16, 1, 128, 128, false, CausalMaskType::TOP_LEFT>;
-    using KernelConfig4 =
-        FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::TOP_LEFT>;
+    std::cout << "\n========== Testing with bfloat16 (SEQ_KV from 4 to 16) ==========" << std::endl;
 
-    // std::cout << "\n========== Testing with float ==========" << std::endl;
-    test_run_attn_bwd_kernel<float, KernelConfig1>(0.3, 0, 1, true, false);
-    test_run_attn_bwd_kernel<float, KernelConfig2>(0.3, 0, 1, true, false);
-    test_run_attn_bwd_kernel<float, KernelConfig3>(0.3, 0, 1, true, false);
-    test_run_attn_bwd_kernel<float, KernelConfig4>(0.3, 0, 1, true, false);
-
-    std::cout << "\n========== Testing with bfloat16 ==========" << std::endl;
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig1>(0, 0, 1, false, false);
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0, 0, 1, false, false);
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0, 0, 1, false, false);
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0, 0, 1, false, false);
+    // Using template metaprogramming to generate tests for SEQ_KV from 4 to 16
+    // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
+    // ENABLE_DROPOUT_MASK, MASK_TYPE TestRunner<4, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 128,
+    // false, CausalMaskType::TOP_LEFT>(
+    TestRunner<4, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 128, false, CausalMaskType::TOP_LEFT>(
+        0,     // dropout_p
+        0,     // warmup_iters
+        1,     // test_iters
+        false, // check_correctness
+        false  // dump_err
+    );
 
     return 0;
 }
