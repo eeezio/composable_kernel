@@ -10,6 +10,7 @@
 #include <chrono>
 #include <random>
 #include <iomanip>
+#include <map>
 
 // clang-format off
 // /opt/rocm/llvm/bin/clang++ -O3 -x hip --offload-arch=gfx950 -o attn_bwd attn_bwd.cpp && ./attn_bwd
@@ -26,6 +27,18 @@
         }                                                                                  \
     } while(0)
 
+enum class CausalMaskType
+{
+    DISABLE      = 0,
+    TOP_LEFT     = 1,
+    BOTTOM_RIGHT = 2
+};
+
+std::map<CausalMaskType, std::string> CausalMaskTypeName = {
+    {CausalMaskType::DISABLE, "DISABLE"},
+    {CausalMaskType::TOP_LEFT, "TOP_LEFT"},
+    {CausalMaskType::BOTTOM_RIGHT, "BOTTOM_RIGHT"}};
+
 template <int BS,
           int HEAD_NUM,
           int SEQ_Q,
@@ -33,17 +46,17 @@ template <int BS,
           int HEAD_DIM,
           int STEP2_BLOCK_SIZE     = 256,
           bool ENABLE_DROPOUT_MASK = true,
-          bool ENABLE_MASK         = true>
+          CausalMaskType MAKS_TYPE = CausalMaskType::DISABLE>
 struct FmhaKernelConfig
 {
-    static constexpr int bs                   = BS;
-    static constexpr int head_num             = HEAD_NUM;
-    static constexpr int seq_q                = SEQ_Q;
-    static constexpr int seq_kv               = SEQ_KV;
-    static constexpr int head_dim             = HEAD_DIM;
-    static constexpr int step2_block_size     = STEP2_BLOCK_SIZE;
-    static constexpr bool enable_dropout_mask = ENABLE_DROPOUT_MASK;
-    static constexpr bool enable_mask         = ENABLE_MASK;
+    static constexpr int bs                        = BS;
+    static constexpr int head_num                  = HEAD_NUM;
+    static constexpr int seq_q                     = SEQ_Q;
+    static constexpr int seq_kv                    = SEQ_KV;
+    static constexpr int head_dim                  = HEAD_DIM;
+    static constexpr int step2_block_size          = STEP2_BLOCK_SIZE;
+    static constexpr bool enable_dropout_mask      = ENABLE_DROPOUT_MASK;
+    static constexpr enum CausalMaskType mask_type = MAKS_TYPE;
 };
 
 template <typename T, typename Config>
@@ -150,10 +163,9 @@ __global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
     }
 }
 
-template <typename T, typename mask_type, typename Config>
+template <typename T, typename Config>
 __global__ void apply_softmax_backward_kernel(const T* attn_weights,
                                               const T* dropout_mask,
-                                              const mask_type* mask,
                                               T* grad_attn,
                                               float dropout_scale)
 {
@@ -193,10 +205,20 @@ __global__ void apply_softmax_backward_kernel(const T* attn_weights,
     }
     __syncthreads();
     grad_score -= attn_weight * reduce_grad_score[thread_id / seq_kv];
-    if constexpr(Config::enable_mask)
+    if constexpr(Config::mask_type == CausalMaskType::TOP_LEFT)
     {
-        mask_type cur_thread_mask = mask[cur_block_offset];
-        if(cur_thread_mask == 0)
+        int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
+        int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
+        if(k_idx > q_idx)
+        {
+            grad_score = T(0.0f);
+        }
+    }
+    else if constexpr(Config::mask_type == CausalMaskType::BOTTOM_RIGHT)
+    {
+        int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
+        int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
+        if(k_idx < q_idx)
         {
             grad_score = T(0.0f);
         }
@@ -298,7 +320,6 @@ struct AttnBackwardKernelLauncher
                                     const T* V,
                                     const T* grad_O,
                                     const T* attn_weights,
-                                    const uint8_t* mask,
                                     const T* dropout_mask,
                                     float dropout_p,
                                     float sqr_dk_scale,
@@ -327,8 +348,8 @@ struct AttnBackwardKernelLauncher
         static_assert(merge_bs * seq_q * seq_kv / Config::step2_block_size > 0);
         dim3 grid2(merge_bs * seq_q * seq_kv / Config::step2_block_size);
         dim3 block2(Config::step2_block_size);
-        apply_softmax_backward_kernel<T, uint8_t, Config>
-            <<<grid2, block2>>>(attn_weights, dropout_mask, mask, workspace, dropout_scale);
+        apply_softmax_backward_kernel<T, Config>
+            <<<grid2, block2>>>(attn_weights, dropout_mask, workspace, dropout_scale);
 
         compute_grad_q_and_grad_k_kernel<T, Config>
             <<<grid, block>>>(workspace, Q, K, grad_Q, grad_K, scale);
@@ -390,7 +411,6 @@ void attn_backward(const T* Q,
                    const T* V,
                    const T* grad_O,
                    const T* attn_weights,
-                   const uint8_t* mask,
                    const T* dropout_mask,
                    float dropout_p,
                    T* grad_Q,
@@ -400,7 +420,8 @@ void attn_backward(const T* Q,
                    int head_num,
                    int q_seq,
                    int kv_seq,
-                   int head_dim)
+                   int head_dim,
+                   CausalMaskType mask_type)
 {
 
     float scale         = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -431,16 +452,14 @@ void attn_backward(const T* Q,
             int offset_V       = (b * head_num + h) * kv_seq * head_dim;
             int offset_grad_O  = (b * head_num + h) * q_seq * head_dim;
             int offset_attn    = (b * head_num + h) * q_seq * kv_seq;
-            int offset_mask    = mask ? (b * head_num + h) * q_seq * kv_seq : 0;
             int offset_dropout = dropout_mask ? (b * head_num + h) * q_seq * kv_seq : 0;
 
-            const T* Q_bh          = Q + offset_Q;
-            const T* K_bh          = K + offset_K;
-            const T* V_bh          = V + offset_V;
-            const T* grad_O_bh     = grad_O + offset_grad_O;
-            const T* attn_bh       = attn_weights + offset_attn;
-            const uint8_t* mask_bh = mask ? mask + offset_mask : nullptr;
-            const T* dropout_bh    = dropout_mask ? dropout_mask + offset_dropout : nullptr;
+            const T* Q_bh       = Q + offset_Q;
+            const T* K_bh       = K + offset_K;
+            const T* V_bh       = V + offset_V;
+            const T* grad_O_bh  = grad_O + offset_grad_O;
+            const T* attn_bh    = attn_weights + offset_attn;
+            const T* dropout_bh = dropout_mask ? dropout_mask + offset_dropout : nullptr;
 
             T* grad_Q_bh = grad_Q + offset_Q;
             T* grad_K_bh = grad_K + offset_K;
@@ -486,13 +505,29 @@ void attn_backward(const T* Q,
             }
 
             // Step 5: Mask backward
-            if(mask_bh != nullptr)
+            if(mask_type == CausalMaskType::TOP_LEFT)
             {
-                for(int i = 0; i < q_seq * kv_seq; i++)
+                for(int i = 0; i < q_seq; i++)
                 {
-                    if(mask_bh[i] == 0)
+                    for(int j = 0; j < kv_seq; j++)
                     {
-                        grad_scores[i] = T(0.0f);
+                        if(j > i)
+                        {
+                            grad_scores[i * kv_seq + j] = T(0.0f);
+                        }
+                    }
+                }
+            }
+            else if(mask_type == CausalMaskType::BOTTOM_RIGHT)
+            {
+                for(int i = 0; i < q_seq; i++)
+                {
+                    for(int j = 0; j < kv_seq; j++)
+                    {
+                        if(j < i)
+                        {
+                            grad_scores[i * kv_seq + j] = T(0.0f);
+                        }
                     }
                 }
             }
@@ -538,7 +573,6 @@ void test_run_attn_bwd_kernel(
     size_t size_V            = bs * head_num * seq_kv * head_dim;
     size_t size_grad_O       = bs * head_num * seq_q * head_dim;
     size_t size_attn_weights = bs * head_num * seq_q * seq_kv;
-    size_t size_mask         = bs * head_num * seq_q * seq_kv;
     size_t size_dropout_mask = bs * head_num * seq_q * seq_kv;
 
     // Allocate host memory
@@ -547,7 +581,6 @@ void test_run_attn_bwd_kernel(
     std::vector<DataType> h_V(size_V);
     std::vector<DataType> h_grad_O(size_grad_O);
     std::vector<DataType> h_attn_weights(size_attn_weights);
-    std::vector<uint8_t> h_mask(size_mask);
     std::vector<DataType> h_dropout_mask(size_dropout_mask);
     std::vector<DataType> h_grad_Q_gpu(size_Q);
     std::vector<DataType> h_grad_K_gpu(size_K);
@@ -596,12 +629,6 @@ void test_run_attn_bwd_kernel(
         }
     }
 
-    // Initialize mask (1 = keep, 0 = mask out)
-    for(size_t i = 0; i < size_mask; i++)
-    {
-        h_mask[i] = Config::enable_mask ? (dis(gen) > 0.0f ? 1 : 0) : 1;
-    }
-
     // Initialize dropout mask (1 = keep, 0 = drop)
     for(size_t i = 0; i < size_dropout_mask; i++)
     {
@@ -617,7 +644,6 @@ void test_run_attn_bwd_kernel(
                   h_V.data(),
                   h_grad_O.data(),
                   h_attn_weights.data(),
-                  Config::enable_mask ? h_mask.data() : nullptr,
                   Config::enable_dropout_mask ? h_dropout_mask.data() : nullptr,
                   dropout_p,
                   h_grad_Q_cpu.data(),
@@ -627,11 +653,11 @@ void test_run_attn_bwd_kernel(
                   head_num,
                   seq_q,
                   seq_kv,
-                  head_dim);
+                  head_dim,
+                  Config::mask_type);
 
     // Allocate device memory
     DataType *d_Q, *d_K, *d_V, *d_grad_O, *d_attn_weights;
-    uint8_t* d_mask;
     DataType* d_dropout_mask;
     DataType *d_grad_Q, *d_grad_K, *d_grad_V, *d_workspace;
 
@@ -640,7 +666,6 @@ void test_run_attn_bwd_kernel(
     HIP_CHECK(hipMalloc(&d_V, size_V * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_grad_O, size_grad_O * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_attn_weights, size_attn_weights * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_mask, size_mask * sizeof(uint8_t)));
     HIP_CHECK(hipMalloc(&d_dropout_mask, size_dropout_mask * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_grad_Q, size_Q * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_grad_K, size_K * sizeof(DataType)));
@@ -659,7 +684,6 @@ void test_run_attn_bwd_kernel(
                         h_attn_weights.data(),
                         size_attn_weights * sizeof(DataType),
                         hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_mask, h_mask.data(), size_mask * sizeof(uint8_t), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_dropout_mask,
                         h_dropout_mask.data(),
                         size_dropout_mask * sizeof(DataType),
@@ -673,7 +697,6 @@ void test_run_attn_bwd_kernel(
                                       d_V,
                                       d_grad_O,
                                       d_attn_weights,
-                                      Config::enable_mask ? d_mask : nullptr,
                                       Config::enable_dropout_mask ? d_dropout_mask : nullptr,
                                       dropout_p,
                                       sqr_dk_scale,
@@ -697,7 +720,6 @@ void test_run_attn_bwd_kernel(
                                       d_V,
                                       d_grad_O,
                                       d_attn_weights,
-                                      Config::enable_mask ? d_mask : nullptr,
                                       Config::enable_dropout_mask ? d_dropout_mask : nullptr,
                                       dropout_p,
                                       sqr_dk_scale,
@@ -773,8 +795,6 @@ void test_run_attn_bwd_kernel(
     // Calculate bandwidth
     size_t bytes_read =
         (size_Q + size_K + size_V + size_grad_O + size_attn_weights) * sizeof(DataType);
-    if(Config::enable_mask)
-        bytes_read += size_mask * sizeof(DataType);
     if(Config::enable_dropout_mask)
         bytes_read += size_dropout_mask * sizeof(DataType);
 
@@ -792,7 +812,7 @@ void test_run_attn_bwd_kernel(
     std::cout << "  Head dimension: " << head_dim << std::endl;
     std::cout << "  Dropout: " << (Config::enable_dropout_mask ? "enabled" : "disabled")
               << std::endl;
-    std::cout << "  Mask: " << (Config::enable_mask ? "enabled" : "disabled") << std::endl;
+    std::cout << "  Mask: " << (CausalMaskTypeName[Config::mask_type]) << std::endl;
     std::cout << std::endl;
 
     if(check_correctness)
@@ -825,7 +845,6 @@ void test_run_attn_bwd_kernel(
     HIP_CHECK(hipFree(d_V));
     HIP_CHECK(hipFree(d_grad_O));
     HIP_CHECK(hipFree(d_attn_weights));
-    HIP_CHECK(hipFree(d_mask));
     HIP_CHECK(hipFree(d_dropout_mask));
     HIP_CHECK(hipFree(d_grad_Q));
     HIP_CHECK(hipFree(d_grad_K));
@@ -838,10 +857,14 @@ void test_run_attn_bwd_kernel(
 int main(int argc, char const* argv[])
 {
     // Create test configuration with all parameters in one place
-    using KernelConfig1 = FmhaKernelConfig<30720, 16, 2, 1, 256, 128, true, true>;
-    using KernelConfig2 = FmhaKernelConfig<30720, 16, 1, 2, 256, 128, true, true>;
-    using KernelConfig3 = FmhaKernelConfig<30720, 32, 2, 1, 128, 128, true, true>;
-    using KernelConfig4 = FmhaKernelConfig<30720, 32, 1, 2, 128, 128, true, true>;
+    using KernelConfig1 =
+        FmhaKernelConfig<30720, 16, 4, 1, 256, 128, false, CausalMaskType::TOP_LEFT>;
+    using KernelConfig2 =
+        FmhaKernelConfig<30720, 16, 1, 4, 256, 128, false, CausalMaskType::TOP_LEFT>;
+    using KernelConfig3 =
+        FmhaKernelConfig<30720, 32, 16, 1, 128, 128, false, CausalMaskType::TOP_LEFT>;
+    using KernelConfig4 =
+        FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::TOP_LEFT>;
 
     // std::cout << "\n========== Testing with float ==========" << std::endl;
     test_run_attn_bwd_kernel<float, KernelConfig1>(0.3, 0, 1, true, false);
@@ -850,10 +873,10 @@ int main(int argc, char const* argv[])
     test_run_attn_bwd_kernel<float, KernelConfig4>(0.3, 0, 1, true, false);
 
     std::cout << "\n========== Testing with bfloat16 ==========" << std::endl;
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig1>(0.3, 0, 1, false, false);
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0.3, 0, 1, false, false);
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0.3, 0, 1, false, false);
-    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0.3, 0, 1, false, false);
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig1>(0, 0, 1, false, false);
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig2>(0, 0, 1, false, false);
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig3>(0, 0, 1, false, false);
+    test_run_attn_bwd_kernel<hip_bfloat16, KernelConfig4>(0, 0, 1, false, false);
 
     return 0;
 }
