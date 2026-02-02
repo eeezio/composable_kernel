@@ -324,7 +324,6 @@ struct AttnForwardKernelLauncher
                                     float dropout_p,
                                     float sqr_dk_scale,
                                     T* O,
-                                    T* attn_weights,
                                     T* workspace)
     {
         constexpr int bs        = Config::bs;
@@ -351,15 +350,6 @@ struct AttnForwardKernelLauncher
         dim3 block2(Config::step2_block_size);
         apply_mask_and_softmax_kernel<T, Config>
             <<<grid2, block2>>>(workspace, dropout_mask, dropout_scale);
-
-        // Copy attention weights to output if needed
-        if(attn_weights != nullptr)
-        {
-            HIP_CHECK(hipMemcpy(attn_weights,
-                                workspace,
-                                merge_bs * seq_q * seq_kv * sizeof(T),
-                                hipMemcpyDeviceToDevice));
-        }
 
         dim3 grid3(merge_bs);
         // // Step 3: Compute output = attn_weights @ V
@@ -559,7 +549,6 @@ void test_run_attn_fwd_kernel(
     size_t size_K            = bs * head_num * seq_kv * head_dim;
     size_t size_V            = bs * head_num * seq_kv * head_dim;
     size_t size_O            = bs * head_num * seq_q * head_dim;
-    size_t size_attn_weights = bs * head_num * seq_q * seq_kv;
     size_t size_dropout_mask = bs * head_num * seq_q * seq_kv;
 
     // Allocate host memory
@@ -569,8 +558,6 @@ void test_run_attn_fwd_kernel(
     std::vector<DataType> h_dropout_mask(size_dropout_mask);
     std::vector<DataType> h_O_gpu(size_O);
     std::vector<DataType> h_O_cpu(size_O);
-    std::vector<DataType> h_attn_weights_gpu(size_attn_weights);
-    std::vector<DataType> h_attn_weights_cpu(size_attn_weights);
 
     // Initialize with random data
     std::random_device rd;
@@ -601,7 +588,7 @@ void test_run_attn_fwd_kernel(
                      Config::enable_dropout_mask ? h_dropout_mask.data() : nullptr,
                      dropout_p,
                      h_O_cpu.data(),
-                     h_attn_weights_cpu.data(),
+                     static_cast<DataType*>(nullptr),
                      bs,
                      head_num,
                      seq_q,
@@ -612,14 +599,13 @@ void test_run_attn_fwd_kernel(
     // Allocate device memory
     DataType *d_Q, *d_K, *d_V;
     DataType* d_dropout_mask;
-    DataType *d_O, *d_attn_weights, *d_workspace;
+    DataType *d_O, *d_workspace;
 
     HIP_CHECK(hipMalloc(&d_Q, size_Q * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_K, size_K * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_V, size_V * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_dropout_mask, size_dropout_mask * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_O, size_O * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_attn_weights, size_attn_weights * sizeof(DataType)));
 
     size_t workspace_size = Launcher::calc_workspace_size();
     HIP_CHECK(hipMalloc(&d_workspace, workspace_size));
@@ -643,7 +629,6 @@ void test_run_attn_fwd_kernel(
                                       dropout_p,
                                       sqr_dk_scale,
                                       d_O,
-                                      d_attn_weights,
                                       d_workspace);
     }
     HIP_CHECK(hipDeviceSynchronize());
@@ -663,7 +648,6 @@ void test_run_attn_fwd_kernel(
                                       dropout_p,
                                       sqr_dk_scale,
                                       d_O,
-                                      d_attn_weights,
                                       d_workspace);
     }
     HIP_CHECK(hipEventRecord(stop));
@@ -685,10 +669,6 @@ void test_run_attn_fwd_kernel(
 
     // Copy results back
     HIP_CHECK(hipMemcpy(h_O_gpu.data(), d_O, size_O * sizeof(DataType), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(h_attn_weights_gpu.data(),
-                        d_attn_weights,
-                        size_attn_weights * sizeof(DataType),
-                        hipMemcpyDeviceToHost));
 
     // Check correctness
     auto check_results = [&](const std::vector<DataType>& gpu,
@@ -751,7 +731,6 @@ void test_run_attn_fwd_kernel(
     {
         std::cout << "Correctness:" << std::endl;
         check_results(h_O_gpu, h_O_cpu, "Output");
-        check_results(h_attn_weights_gpu, h_attn_weights_cpu, "Attention Weights");
         std::cout << std::endl;
     }
     std::cout << "Memory:" << std::endl;
@@ -776,7 +755,6 @@ void test_run_attn_fwd_kernel(
     HIP_CHECK(hipFree(d_V));
     HIP_CHECK(hipFree(d_dropout_mask));
     HIP_CHECK(hipFree(d_O));
-    HIP_CHECK(hipFree(d_attn_weights));
     HIP_CHECK(hipFree(d_workspace));
     HIP_CHECK(hipEventDestroy(start));
     HIP_CHECK(hipEventDestroy(stop));
@@ -856,7 +834,7 @@ int main(int argc, char const* argv[])
     // Using template metaprogramming to generate tests for SEQ_KV from 4 to 16
     // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
     // ENABLE_DROPOUT_MASK, MASK_TYPE
-    TestRunner<4, 16>::run<float, 30720, 32, 1, 128, 128, false, CausalMaskType::BOTTOM_RIGHT>(
+    TestRunner<4, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 128, false, CausalMaskType::DISABLE>(
         0, // dropout_p
         0, // warmup_iters
         1, // test_iters
