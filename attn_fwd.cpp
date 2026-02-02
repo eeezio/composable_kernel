@@ -62,71 +62,96 @@ struct FmhaKernelConfig
 template <typename T, typename Config>
 __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float scale)
 {
-    constexpr int seq_q                       = Config::seq_q;
-    constexpr int seq_kv                      = Config::seq_kv;
-    constexpr int head_dim                    = Config::head_dim;
-    constexpr int warp_size                   = 64;
-    constexpr int process_head_dim_per_thread = head_dim / warp_size;
-
-    const uint32_t block_id  = blockIdx.x;
-    const uint32_t thread_id = threadIdx.x;
-
-    const T* Q_ptr = Q + block_id * seq_q * head_dim;
-    const T* K_ptr = K + block_id * seq_kv * head_dim;
-    T* scores_ptr  = scores + block_id * seq_q * seq_kv;
-
-    // Prefetch K to shared memory
-    __shared__ T fetch_K[seq_kv * head_dim];
+    constexpr int seq_q = Config::seq_q;
+    static_assert(seq_q == 1, "seq_q must be 1 for this kernel implementation.");
+    // static_assert(std::is_same<T, hip_bfloat16>::value,
+    //               "This kernel only supports hip_bfloat16 data type.");
+    constexpr int seq_kv            = Config::seq_kv;
+    constexpr int head_dim          = Config::head_dim;
+    constexpr int block_k           = 32;
+    constexpr int thread_block_size = 64;
+    int cur_thread_process_batch    = threadIdx.x;
+    int cur_block_offset            = blockIdx.x * thread_block_size;
+    float results[seq_kv];
+    T fetch_Q[block_k];
+    T fetch_K[block_k];
+    T* Q_ptr     = (T*)&Q[(cur_block_offset + cur_thread_process_batch) * head_dim];
+    T* K_ptr     = (T*)&K[(cur_block_offset + cur_thread_process_batch) * head_dim * seq_kv];
+    T* score_ptr = (T*)&scores[(cur_block_offset + cur_thread_process_batch) * seq_kv];
+    uint4 ls_dwordx4_tmp_var;
+#pragma unroll
+    for(int i = 0; i < seq_kv; i++)
+        results[i] = 0.0f;
+    for(int head_idx = 0; head_idx < head_dim; head_idx += block_k)
+    {
+        if constexpr(std::is_same<T, hip_bfloat16>::value)
+        {
+            for(int k = 0; k < block_k / 8; k++)
+            {
+                ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[head_idx + k * 8]);
+                fetch_Q[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
+                fetch_Q[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
+                fetch_Q[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
+                fetch_Q[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
+                fetch_Q[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
+                fetch_Q[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
+                fetch_Q[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
+                fetch_Q[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
+            }
+            for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
+            {
+                for(int k = 0; k < block_k / 8; k++)
+                {
+                    ls_dwordx4_tmp_var = *((uint4*)&K_ptr[kv_idx * head_dim + head_idx + k * 8]);
+                    fetch_K[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
+                    fetch_K[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
+                    fetch_K[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
+                    fetch_K[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
+                    fetch_K[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
+                    fetch_K[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
+                    fetch_K[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
+                    fetch_K[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
+                }
+#pragma unroll
+                for(int k = 0; k < block_k; k++)
+                {
+                    results[kv_idx] +=
+                        static_cast<float>(fetch_Q[k]) * static_cast<float>(fetch_K[k]);
+                }
+            }
+        }
+        else
+        {
+            for(int k = 0; k < block_k / 4; k++)
+            {
+                ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[head_idx + k * 4]);
+                fetch_Q[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
+                fetch_Q[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
+                fetch_Q[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
+                fetch_Q[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
+            }
+            for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
+            {
+                for(int k = 0; k < block_k / 4; k++)
+                {
+                    ls_dwordx4_tmp_var = *((uint4*)&K_ptr[kv_idx * head_dim + head_idx + k * 4]);
+                    fetch_K[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
+                    fetch_K[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
+                    fetch_K[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
+                    fetch_K[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
+                }
+#pragma unroll
+                for(int k = 0; k < block_k; k++)
+                {
+                    results[kv_idx] += fetch_Q[k] * fetch_K[k];
+                }
+            }
+        }
+    }
 #pragma unroll
     for(int i = 0; i < seq_kv; i++)
     {
-#pragma unroll
-        for(int k = 0; k < process_head_dim_per_thread; k++)
-        {
-            fetch_K[i * head_dim + thread_id * process_head_dim_per_thread + k] =
-                K_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k];
-        }
-    }
-    __syncthreads();
-
-    // compute scores = Q @ K^T / scale
-    // Each thread computes partial sum over head_dim, then reduce
-    __shared__ T reduce_buffer[head_dim / process_head_dim_per_thread];
-
-#pragma unroll
-    for(int i = 0; i < seq_q; i++)
-    {
-#pragma unroll
-        for(int j = 0; j < seq_kv; j++)
-        {
-            // Each thread computes one element of the dot product
-            T partial_sum = T(0.0f);
-#pragma unroll
-            for(int k = 0; k < process_head_dim_per_thread; k++)
-            {
-                partial_sum += Q_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k] *
-                               fetch_K[j * head_dim + thread_id * process_head_dim_per_thread + k];
-            }
-            reduce_buffer[thread_id] = partial_sum;
-            __syncthreads();
-
-            // Parallel reduction in shared memory
-            for(int stride = head_dim / (2 * process_head_dim_per_thread); stride > 0; stride >>= 1)
-            {
-                if(thread_id < stride)
-                {
-                    reduce_buffer[thread_id] += reduce_buffer[thread_id + stride];
-                }
-                __syncthreads();
-            }
-
-            // Only thread 0 writes the final result
-            if(thread_id == 0)
-            {
-                scores_ptr[i * seq_kv + j] = reduce_buffer[0] * scale;
-            }
-            __syncthreads();
-        }
+        score_ptr[i] = T(results[i] * scale);
     }
 }
 
@@ -313,19 +338,19 @@ struct AttnForwardKernelLauncher
         float scale            = sqr_dk_scale;
         float dropout_scale    = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
 
-        dim3 grid(merge_bs);
+        dim3 grid(merge_bs / warp_size);
         dim3 block(warp_size);
 
         // Step 1: Compute scores = Q @ K^T / sqrt(d_k)
         compute_scores_kernel<T, Config><<<grid, block>>>(Q, K, workspace, scale);
 
         // Step 2: Apply mask and softmax (with dropout)
-        // constexpr int work_thread_num =
-        //     Config::step2_block_size / (seq_q * seq_kv) * (seq_q * seq_kv);
-        // dim3 grid2((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
-        // dim3 block2(Config::step2_block_size);
-        // apply_mask_and_softmax_kernel<T, Config>
-        //     <<<grid2, block2>>>(workspace, dropout_mask, dropout_scale);
+        constexpr int work_thread_num =
+            Config::step2_block_size / (seq_q * seq_kv) * (seq_q * seq_kv);
+        dim3 grid2((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
+        dim3 block2(Config::step2_block_size);
+        apply_mask_and_softmax_kernel<T, Config>
+            <<<grid2, block2>>>(workspace, dropout_mask, dropout_scale);
 
         // Copy attention weights to output if needed
         if(attn_weights != nullptr)
@@ -336,8 +361,9 @@ struct AttnForwardKernelLauncher
                                 hipMemcpyDeviceToDevice));
         }
 
-        // Step 3: Compute output = attn_weights @ V
-        // compute_output_kernel<T, Config><<<grid, block>>>(workspace, V, O);
+        dim3 grid3(merge_bs);
+        // // Step 3: Compute output = attn_weights @ V
+        compute_output_kernel<T, Config><<<grid3, block>>>(workspace, V, O);
     }
 };
 
@@ -830,12 +856,12 @@ int main(int argc, char const* argv[])
     // Using template metaprogramming to generate tests for SEQ_KV from 4 to 16
     // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
     // ENABLE_DROPOUT_MASK, MASK_TYPE
-    TestRunner<4, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 128, false, CausalMaskType::TOP_LEFT>(
-        0,     // dropout_p
-        0,     // warmup_iters
-        1,     // test_iters
-        false, // check_correctness
-        false  // dump_err
+    TestRunner<4, 16>::run<float, 30720, 32, 1, 128, 128, false, CausalMaskType::BOTTOM_RIGHT>(
+        0, // dropout_p
+        0, // warmup_iters
+        1, // test_iters
+        0, // check_correctness
+        0  // dump_err
     );
 
     return 0;
