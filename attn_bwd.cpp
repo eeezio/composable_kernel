@@ -59,12 +59,9 @@ struct FmhaKernelConfig
     static constexpr enum CausalMaskType mask_type = MAKS_TYPE;
 };
 
+// Kernel 1: Compute grad_V = attn_weights^T @ grad_O
 template <typename T, typename Config>
-__global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
-                                                    const T* grad_O,
-                                                    const T* V,
-                                                    T* grad_V,
-                                                    T* workspace) // store grad_attn
+__global__ void compute_grad_v_kernel(const T* attn_weights, const T* grad_O, T* grad_V)
 {
     constexpr int seq_q                       = Config::seq_q;
     constexpr int seq_kv                      = Config::seq_kv;
@@ -77,11 +74,11 @@ __global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
 
     const T* attn_weights_ptr = attn_weights + block_id * seq_q * seq_kv;
     const T* grad_O_ptr       = grad_O + block_id * seq_q * head_dim;
-    const T* V_ptr            = V + block_id * seq_kv * head_dim;
     T* grad_V_ptr             = grad_V + block_id * seq_kv * head_dim;
-    T* workspace_ptr          = workspace + block_id * seq_q * seq_kv;
+
     __shared__ T fetch_grad_O[seq_q * head_dim];
-// fetch grad_O to shared memory
+
+    // Fetch grad_O to shared memory
 #pragma unroll
     for(int i = 0; i < seq_q; i++)
     {
@@ -93,15 +90,16 @@ __global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
         }
     }
     __syncthreads();
-// compute grad_V = attn_weights^T @ grad_O
+
+    // Compute grad_V = attn_weights^T @ grad_O
 #pragma unroll
     for(int i = 0; i < seq_kv; i++)
     {
-        T sums[process_head_dim_per_thread];
+        float sums[process_head_dim_per_thread];
 #pragma unroll
         for(int k = 0; k < process_head_dim_per_thread; k++)
         {
-            sums[k] = T(0.0f);
+            sums[k] = 0.0f;
         }
 #pragma unroll
         for(int j = 0; j < seq_q; j++)
@@ -109,65 +107,134 @@ __global__ void compute_grad_v_and_grad_attn_kernel(const T* attn_weights,
 #pragma unroll
             for(int k = 0; k < process_head_dim_per_thread; k++)
             {
-                sums[k] += attn_weights_ptr[j * seq_kv + i] *
-                           fetch_grad_O[j * head_dim + thread_id * process_head_dim_per_thread + k];
+                sums[k] +=
+                    static_cast<float>(attn_weights_ptr[j * seq_kv + i]) *
+                    static_cast<float>(
+                        fetch_grad_O[j * head_dim + thread_id * process_head_dim_per_thread + k]);
             }
         }
 #pragma unroll
         for(int k = 0; k < process_head_dim_per_thread; k++)
         {
-            grad_V_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k] = sums[k];
-        }
-    }
-    __syncthreads();
-
-    // compute grad_attn = grad_O @ V^T
-    // Each thread computes partial sum over head_dim, then reduce
-    __shared__ T reduce_buffer[head_dim / process_head_dim_per_thread];
-
-#pragma unroll
-    for(int i = 0; i < seq_q; i++)
-    {
-#pragma unroll
-        for(int j = 0; j < seq_kv; j++)
-        {
-            // Each thread computes one element of the dot product
-            T partial_sum = T(0.0f);
-#pragma unroll
-            for(int k = 0; k < process_head_dim_per_thread; k++)
-            {
-                partial_sum +=
-                    fetch_grad_O[i * head_dim + thread_id * process_head_dim_per_thread + k] *
-                    V_ptr[j * head_dim + thread_id * process_head_dim_per_thread + k];
-            }
-            reduce_buffer[thread_id] = partial_sum;
-            __syncthreads();
-
-            // Parallel reduction in shared memory
-            for(int stride = head_dim / (2 * process_head_dim_per_thread); stride > 0; stride >>= 1)
-            {
-                if(thread_id < stride)
-                {
-                    reduce_buffer[thread_id] += reduce_buffer[thread_id + stride];
-                }
-                __syncthreads();
-            }
-
-            // Only thread 0 writes the final result
-            if(thread_id == 0)
-            {
-                workspace_ptr[i * seq_kv + j] = reduce_buffer[0];
-            }
-            __syncthreads();
+            grad_V_ptr[i * head_dim + thread_id * process_head_dim_per_thread + k] = T(sums[k]);
         }
     }
 }
 
+// Kernel 2: Compute grad_attn = grad_O @ V^T (similar to compute_scores_kernel)
 template <typename T, typename Config>
-__global__ void apply_softmax_backward_kernel(const T* attn_weights,
-                                              const T* dropout_mask,
-                                              T* grad_attn,
-                                              float dropout_scale)
+__global__ void compute_grad_attn_kernel(const T* grad_O, const T* V, T* grad_attn)
+{
+    constexpr int seq_q = Config::seq_q;
+    static_assert(seq_q == 1, "seq_q must be 1 for this kernel implementation.");
+
+    constexpr int seq_kv            = Config::seq_kv;
+    constexpr int head_dim          = Config::head_dim;
+    constexpr int block_k           = 32;
+    constexpr int thread_block_size = 64;
+
+    int cur_thread_process_batch = threadIdx.x;
+    int cur_block_offset         = blockIdx.x * thread_block_size;
+
+    float results[seq_kv];
+    T fetch_grad_O[block_k];
+    T fetch_V[block_k];
+
+    T* grad_O_ptr    = (T*)&grad_O[(cur_block_offset + cur_thread_process_batch) * head_dim];
+    T* V_ptr         = (T*)&V[(cur_block_offset + cur_thread_process_batch) * head_dim * seq_kv];
+    T* grad_attn_ptr = (T*)&grad_attn[(cur_block_offset + cur_thread_process_batch) * seq_kv];
+
+    uint4 ls_dwordx4_tmp_var;
+
+#pragma unroll
+    for(int i = 0; i < seq_kv; i++)
+        results[i] = 0.0f;
+
+    for(int head_idx = 0; head_idx < head_dim; head_idx += block_k)
+    {
+        if constexpr(std::is_same<T, hip_bfloat16>::value)
+        {
+            // Load grad_O
+            for(int k = 0; k < block_k / 8; k++)
+            {
+                ls_dwordx4_tmp_var      = *((uint4*)&grad_O_ptr[head_idx + k * 8]);
+                fetch_grad_O[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
+                fetch_grad_O[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
+                fetch_grad_O[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
+                fetch_grad_O[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
+                fetch_grad_O[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
+                fetch_grad_O[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
+                fetch_grad_O[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
+                fetch_grad_O[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
+            }
+
+            // Load V and compute dot product
+            for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
+            {
+                for(int k = 0; k < block_k / 8; k++)
+                {
+                    ls_dwordx4_tmp_var = *((uint4*)&V_ptr[kv_idx * head_dim + head_idx + k * 8]);
+                    fetch_V[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
+                    fetch_V[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
+                    fetch_V[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
+                    fetch_V[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
+                    fetch_V[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
+                    fetch_V[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
+                    fetch_V[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
+                    fetch_V[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
+                }
+#pragma unroll
+                for(int k = 0; k < block_k; k++)
+                {
+                    results[kv_idx] +=
+                        static_cast<float>(fetch_grad_O[k]) * static_cast<float>(fetch_V[k]);
+                }
+            }
+        }
+        else
+        {
+            // FP32 path
+            for(int k = 0; k < block_k / 4; k++)
+            {
+                ls_dwordx4_tmp_var      = *((uint4*)&grad_O_ptr[head_idx + k * 4]);
+                fetch_grad_O[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
+                fetch_grad_O[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
+                fetch_grad_O[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
+                fetch_grad_O[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
+            }
+
+            for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
+            {
+                for(int k = 0; k < block_k / 4; k++)
+                {
+                    ls_dwordx4_tmp_var = *((uint4*)&V_ptr[kv_idx * head_dim + head_idx + k * 4]);
+                    fetch_V[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
+                    fetch_V[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
+                    fetch_V[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
+                    fetch_V[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
+                }
+#pragma unroll
+                for(int k = 0; k < block_k; k++)
+                {
+                    results[kv_idx] += fetch_grad_O[k] * fetch_V[k];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for(int i = 0; i < seq_kv; i++)
+    {
+        grad_attn_ptr[i] = T(results[i]);
+    }
+}
+
+// Kernel 3: Apply softmax backward and mask
+template <typename T, typename Config>
+__global__ void softmax_backward_kernel(const T* attn_weights,
+                                        const T* dropout_mask,
+                                        T* grad_attn,
+                                        float dropout_scale)
 {
     const uint32_t block_id          = blockIdx.x;
     const uint32_t thread_id         = threadIdx.x;
@@ -196,7 +263,8 @@ __global__ void apply_softmax_backward_kernel(const T* attn_weights,
         T grad_score              = grad_attn_value * attn_weight;
         tmp_grad_score[thread_id] = grad_score;
         __syncthreads();
-        // reduce within block
+
+        // Reduce within block
         if(thread_id < real_reduce_score_num)
         {
             T sum = T(0.0f);
@@ -208,7 +276,10 @@ __global__ void apply_softmax_backward_kernel(const T* attn_weights,
             reduce_grad_score[thread_id] = sum;
         }
         __syncthreads();
+
         grad_score -= attn_weight * reduce_grad_score[thread_id / seq_kv];
+
+        // Apply causal mask
         if constexpr(Config::mask_type == CausalMaskType::TOP_LEFT)
         {
             int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
@@ -231,8 +302,9 @@ __global__ void apply_softmax_backward_kernel(const T* attn_weights,
     }
 }
 
+// Kernel 4: Compute grad_Q and grad_K
 template <typename T, typename Config>
-__global__ void compute_grad_q_and_grad_k_kernel(
+__global__ void compute_grad_qk_kernel(
     const T* grad_scores, const T* Q, const T* K, T* grad_Q, T* grad_K, float scale)
 {
     const uint32_t block_id                   = blockIdx.x;
@@ -249,7 +321,7 @@ __global__ void compute_grad_q_and_grad_k_kernel(
     T* grad_Q_ptr            = grad_Q + block_id * seq_q * head_dim;
     T* grad_K_ptr            = grad_K + block_id * seq_kv * head_dim;
 
-    // compute grad_Q = grad_scores @ K
+    // Compute grad_Q = grad_scores @ K * scale
 #pragma unroll
     for(int i = 0; i < seq_q; i++)
     {
@@ -276,7 +348,8 @@ __global__ void compute_grad_q_and_grad_k_kernel(
                 sums[k] * scale;
         }
     }
-    // compute grad_K = grad_scores^T @ Q
+
+    // Compute grad_K = grad_scores^T @ Q * scale
 #pragma unroll
     for(int i = 0; i < seq_kv; i++)
     {
@@ -347,20 +420,26 @@ struct AttnBackwardKernelLauncher
         dim3 grid(merge_bs);
         dim3 block(warp_size);
 
-        compute_grad_v_and_grad_attn_kernel<T, Config>
-            <<<grid, block>>>(attn_weights, grad_O, V, grad_V, workspace);
+        // Step 1: Compute grad_V = attn_weights^T @ grad_O
+        compute_grad_v_kernel<T, Config><<<grid, block>>>(attn_weights, grad_O, grad_V);
 
+        // Step 2: Compute grad_attn = grad_O @ V^T
+        dim3 grid_grad_attn(merge_bs / warp_size);
+        compute_grad_attn_kernel<T, Config><<<grid_grad_attn, block>>>(grad_O, V, workspace);
+
+        // Step 3: Apply softmax backward and mask
         constexpr int work_thread_num =
             Config::step2_block_size / (seq_q * seq_kv) * (seq_q * seq_kv);
-        dim3 grid2((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
-        dim3 block2(Config::step2_block_size);
-        apply_softmax_backward_kernel<T, Config>
-            <<<grid2, block2>>>(attn_weights, dropout_mask, workspace, dropout_scale);
+        dim3 grid_softmax((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
+        dim3 block_softmax(Config::step2_block_size);
+        softmax_backward_kernel<T, Config>
+            <<<grid_softmax, block_softmax>>>(attn_weights, dropout_mask, workspace, dropout_scale);
 
-        compute_grad_q_and_grad_k_kernel<T, Config>
-            <<<grid, block>>>(workspace, Q, K, grad_Q, grad_K, scale);
+        // Step 4: Compute grad_Q and grad_K
+        compute_grad_qk_kernel<T, Config><<<grid, block>>>(workspace, Q, K, grad_Q, grad_K, scale);
     }
 };
+
 // Helper function: Matrix multiplication C = A @ B
 // A: [rows_a, cols_a], B: [cols_a, cols_b], C: [rows_a, cols_b]
 template <typename T>
@@ -472,15 +551,13 @@ void attn_backward(const T* Q,
             T* grad_V_bh = grad_V + offset_V;
 
             // Step 1: grad_V = attn_weights^T @ grad_O
-            // attn_weights: [q_seq, kv_seq], grad_O: [q_seq, head_dim] -> grad_V: [kv_seq,
-            // head_dim]
             transpose(attn_bh, attn_T.data(), q_seq, kv_seq);
             matmul(attn_T.data(), grad_O_bh, grad_V_bh, kv_seq, q_seq, head_dim);
 
             // Step 2: grad_attn = grad_O @ V^T
-            // grad_O: [q_seq, head_dim], V: [kv_seq, head_dim] -> grad_attn: [q_seq, kv_seq]
             transpose(V_bh, V_T.data(), kv_seq, head_dim);
             matmul(grad_O_bh, V_T.data(), grad_attn.data(), q_seq, head_dim, kv_seq);
+
             // Step 3: Dropout backward
             if(dropout_p > 0.0f && dropout_bh != nullptr)
             {
@@ -491,8 +568,6 @@ void attn_backward(const T* Q,
             }
 
             // Step 4: Softmax backward
-            // grad_scores = (grad_attn * attn_weights) - attn_weights * sum(grad_attn *
-            // attn_weights, dim=-1)
             for(int i = 0; i < q_seq * kv_seq; i++)
             {
                 grad_scores[i] = T(float(grad_attn[i]) * float(attn_bh[i]));
@@ -538,16 +613,14 @@ void attn_backward(const T* Q,
                 }
             }
 
-            // Step 6: grad_Q = grad_scores @ K / scale
-            // grad_scores: [q_seq, kv_seq], K: [kv_seq, head_dim] -> grad_Q: [q_seq, head_dim]
+            // Step 6: grad_Q = grad_scores @ K * scale
             matmul(grad_scores.data(), K_bh, grad_Q_bh, q_seq, kv_seq, head_dim);
             for(int i = 0; i < q_seq * head_dim; i++)
             {
                 grad_Q_bh[i] = T(float(grad_Q_bh[i]) * scale);
             }
 
-            // Step 7: grad_K = grad_scores^T @ Q / scale
-            // grad_scores: [q_seq, kv_seq], Q: [q_seq, head_dim] -> grad_K: [kv_seq, head_dim]
+            // Step 7: grad_K = grad_scores^T @ Q * scale
             transpose(grad_scores.data(), grad_scores_T.data(), q_seq, kv_seq);
             matmul(grad_scores_T.data(), Q_bh, grad_K_bh, kv_seq, q_seq, head_dim);
             for(int i = 0; i < kv_seq * head_dim; i++)
@@ -703,7 +776,8 @@ void test_run_attn_bwd_kernel(
                                       d_V,
                                       d_grad_O,
                                       d_attn_weights,
-                                      Config::enable_dropout_mask ? d_dropout_mask : nullptr,
+                                      Config::enable_dropout_mask ? d_dropout_mask
+                                                                  : static_cast<DataType*>(nullptr),
                                       dropout_p,
                                       sqr_dk_scale,
                                       d_grad_Q,
@@ -726,7 +800,8 @@ void test_run_attn_bwd_kernel(
                                       d_V,
                                       d_grad_O,
                                       d_attn_weights,
-                                      Config::enable_dropout_mask ? d_dropout_mask : nullptr,
+                                      Config::enable_dropout_mask ? d_dropout_mask
+                                                                  : static_cast<DataType*>(nullptr),
                                       dropout_p,
                                       sqr_dk_scale,
                                       d_grad_Q,
@@ -742,12 +817,6 @@ void test_run_attn_bwd_kernel(
     double avg_time_ms = elapsed_ms / test_iters;
 
     // Calculate TFLOPS
-    // Main matrix operations in attention backward:
-    // 1. grad_V = attn_weights^T @ grad_O: [kv_seq, q_seq] @ [q_seq, head_dim]
-    // 2. grad_attn = grad_O @ V^T: [q_seq, head_dim] @ [head_dim, kv_seq]
-    // 3. grad_Q = grad_scores @ K: [q_seq, kv_seq] @ [kv_seq, head_dim]
-    // 4. grad_K = grad_scores^T @ Q: [kv_seq, q_seq] @ [q_seq, head_dim]
-    // Each matmul: FLOPs = 2 * M * N * K (multiply-add)
     double flops_per_batch_head = 2.0 * seq_kv * head_dim * seq_q + // grad_V
                                   2.0 * seq_q * seq_kv * head_dim + // grad_attn
                                   2.0 * seq_q * head_dim * seq_kv + // grad_Q
@@ -931,10 +1000,6 @@ int main(int argc, char const* argv[])
 {
     std::cout << "\n========== Testing with bfloat16 (SEQ_KV from 4 to 16) ==========" << std::endl;
 
-    // Using template metaprogramming to generate tests for SEQ_KV from 4 to 16
-    // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
-    // ENABLE_DROPOUT_MASK, MASK_TYPE TestRunner<4, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 128,
-    // false, CausalMaskType::TOP_LEFT>(
     TestRunner<4, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 128, false, CausalMaskType::TOP_LEFT>(
         0,     // dropout_p
         0,     // warmup_iters
