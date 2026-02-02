@@ -1,0 +1,301 @@
+
+========== Testing with bfloat16 (SEQ_KV from 4 to 16) ==========
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 4
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 2524.45 MB
+  Total data write: 2264.92 MB
+  Total data transfer: 4789.37 MB
+  Workspace size: 7.86 MB
+
+Performance:
+  Average time: 4.962 ms
+  Bandwidth: 965.13 GB/s
+  TFLOPS: 0.81
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 5
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 3029.73 MB
+  Total data write: 2768.24 MB
+  Total data transfer: 5797.97 MB
+  Workspace size: 9.83 MB
+
+Performance:
+  Average time: 2.912 ms
+  Bandwidth: 1990.75 GB/s
+  TFLOPS: 1.73
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 6
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 3535.01 MB
+  Total data write: 3271.56 MB
+  Total data transfer: 6806.57 MB
+  Workspace size: 11.80 MB
+
+Performance:
+  Average time: 3.509 ms
+  Bandwidth: 1939.89 GB/s
+  TFLOPS: 1.72
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 7
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 4040.29 MB
+  Total data write: 3774.87 MB
+  Total data transfer: 7815.17 MB
+  Workspace size: 13.76 MB
+
+Performance:
+  Average time: 4.005 ms
+  Bandwidth: 1951.44 GB/s
+  TFLOPS: 1.76
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 8
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 4545.58 MB
+  Total data write: 4278.19 MB
+  Total data transfer: 8823.77 MB
+  Workspace size: 15.73 MB
+
+Performance:
+  Average time: 4.600 ms
+  Bandwidth: 1918.20 GB/s
+  TFLOPS: 1.75
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 9
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 5050.86 MB
+  Total data write: 4781.51 MB
+  Total data transfer: 9832.37 MB
+  Workspace size: 17.69 MB
+
+Performance:
+  Average time: 5.073 ms
+  Bandwidth: 1938.17 GB/s
+  TFLOPS: 1.79
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 10
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 5556.14 MB
+  Total data write: 5284.82 MB
+  Total data transfer: 10840.97 MB
+  Workspace size: 19.66 MB
+
+Performance:
+  Average time: 5.836 ms
+  Bandwidth: 1857.63 GB/s
+  TFLOPS: 1.72
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 11
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 6061.42 MB
+  Total data write: 5788.14 MB
+  Total data transfer: 11849.56 MB
+  Workspace size: 21.63 MB
+
+Performance:
+  Average time: 6.333 ms
+  Bandwidth: 1871.05 GB/s
+  TFLOPS: 1.75
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 12
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 6566.71 MB
+  Total data write: 6291.46 MB
+  Total data transfer: 12858.16 MB
+  Workspace size: 23.59 MB
+
+Performance:
+  Average time: 6.926 ms
+  Bandwidth: 1856.51 GB/s
+  TFLOPS: 1.74
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 13
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 7071.99 MB
+  Total data write: 6794.77 MB
+  Total data transfer: 13866.76 MB
+  Workspace size: 25.56 MB
+
+Performance:
+  Average time: 7.511 ms
+  Bandwidth: 1846.14 GB/s
+  TFLOPS: 1.74
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 14
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 7577.27 MB
+  Total data write: 7298.09 MB
+  Total data transfer: 14875.36 MB
+  Workspace size: 27.53 MB
+
+Performance:
+  Average time: 8.026 ms
+  Bandwidth: 1853.45 GB/s
+  TFLOPS: 1.76
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 15
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 8082.55 MB
+  Total data write: 7801.41 MB
+  Total data transfer: 15883.96 MB
+  Workspace size: 29.49 MB
+
+Performance:
+  Average time: 8.658 ms
+  Bandwidth: 1834.69 GB/s
+  TFLOPS: 1.74
+====================================
+
+
+===== run_attn_bwd_kernel Test =====
+Configuration:
+  Batch size: 30720
+  Heads: 32
+  Q sequence length: 1
+  KV sequence length: 16
+  Head dimension: 128
+  Dropout: disabled
+  Mask: TOP_LEFT
+
+Memory:
+  Total data read: 8587.84 MB
+  Total data write: 8304.72 MB
+  Total data transfer: 16892.56 MB
+  Workspace size: 31.46 MB
+
+Performance:
+  Average time: 8.971 ms
+  Bandwidth: 1882.99 GB/s
+  TFLOPS: 1.80
+====================================
+

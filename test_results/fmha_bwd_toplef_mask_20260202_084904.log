@@ -1,0 +1,39 @@
+=== Test with s_k=4 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/4, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 42.636 ms, 0.12 TFlops, 118.14 GB/s
+
+=== Test with s_k=5 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/5, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 42.503 ms, 0.15 TFlops, 142.20 GB/s
+
+=== Test with s_k=6 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/6, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 42.793 ms, 0.18 TFlops, 164.76 GB/s
+
+=== Test with s_k=7 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/7, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 42.904 ms, 0.21 TFlops, 187.79 GB/s
+
+=== Test with s_k=8 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/8, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.001 ms, 0.23 TFlops, 210.78 GB/s
+
+=== Test with s_k=9 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/9, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.114 ms, 0.26 TFlops, 233.57 GB/s
+
+=== Test with s_k=10 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/10, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.189 ms, 0.29 TFlops, 256.47 GB/s
+
+=== Test with s_k=11 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/11, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.358 ms, 0.32 TFlops, 278.69 GB/s
+
+=== Test with s_k=12 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/12, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.509 ms, 0.35 TFlops, 300.86 GB/s
+
+=== Test with s_k=13 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/13, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.453 ms, 0.38 TFlops, 324.41 GB/s
+
+=== Test with s_k=14 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/14, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.659 ms, 0.40 TFlops, 345.94 GB/s
+
+=== Test with s_k=15 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/15, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.827 ms, 0.43 TFlops, 367.59 GB/s
+
+=== Test with s_k=16 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/16, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:1, s_randval:0, deterministic:0, mask:t(-1:0), 43.875 ms, 0.46 TFlops, 390.13 GB/s
+

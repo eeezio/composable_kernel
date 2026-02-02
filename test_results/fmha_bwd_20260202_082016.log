@@ -1,0 +1,26 @@
+=== Test with s_k=4 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/4, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 7.504 ms, 0.67 TFlops, 671.22 GB/s
+=== Test with s_k=5 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/5, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 7.617 ms, 0.83 TFlops, 793.44 GB/s
+=== Test with s_k=6 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/6, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 7.811 ms, 0.97 TFlops, 902.61 GB/s
+=== Test with s_k=7 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/7, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 7.988 ms, 1.10 TFlops, 1008.60 GB/s
+=== Test with s_k=8 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/8, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 8.098 ms, 1.24 TFlops, 1119.22 GB/s
+=== Test with s_k=9 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/9, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 8.273 ms, 1.37 TFlops, 1217.22 GB/s
+=== Test with s_k=10 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/10, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 8.470 ms, 1.49 TFlops, 1307.71 GB/s
+=== Test with s_k=11 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/11, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 8.649 ms, 1.60 TFlops, 1397.10 GB/s
+=== Test with s_k=12 ===
+[bf16|batch|bhsd] b:30720, h:32/32, s:1/12, d:128/128, scale:0.0883883, bias:n, dbias:0, p_drop:0, s_randval:0, deterministic:0, mask:n, 8.853 ms, 1.71 TFlops, 1478.63 GB/s
+=== Test with s_k=13 ===
+
+=== Test with s_k=14 ===
+
+=== Test with s_k=15 ===
+
+=== Test with s_k=16 ===
+

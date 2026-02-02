@@ -96,3 +96,9 @@ experimental/grouped_convolution_tile_instances/instances/*
 !experimental/grouped_convolution_tile_instances/instances/*.in
 !experimental/grouped_convolution_tile_instances/instances/*.inc
 experimental/grouped_convolution_tile_instances/*.inc
+
+attn_fwd-hip*
+attn_fwd-host*
+attn_bwd-hip*
+attn_bwd-host*
+*hipfb
