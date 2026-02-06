@@ -859,11 +859,11 @@ int main(int argc, char const* argv[])
     // Using template metaprogramming to generate tests for SEQ_KV from 4 to 16
     // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
     // ENABLE_DROPOUT_MASK, MASK_TYPE
-    TestRunner<2, 2>::run<float, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
+    TestRunner<2, 2>::run<hip_bfloat16, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
         0, // dropout_p
-        0, // warmup_iters
-        1, // test_iters
-        1, // check_correctness
+        5, // warmup_iters
+        3, // test_iters
+        0, // check_correctness
         0  // dump_err
     );
 
