@@ -27,6 +27,89 @@
         }                                                                                  \
     } while(0)
 
+// GPU硬件信息结构体
+struct GPUInfo
+{
+    int device_id;
+    std::string device_name;
+    int compute_units;           // CU数量
+    int max_threads_per_block;   // 每个block最大线程数
+    int max_threads_per_cu;      // 每个CU最大线程数
+    int warp_size;               // Wavefront size
+    int max_blocks_per_cu;       // 每个CU可以同时运行的最大blocks数（估算）
+    size_t total_global_mem;     // 全局内存大小
+    size_t shared_mem_per_block; // 每个block的shared memory
+    int multiprocessor_count;    // 多处理器数量
+    int max_waves_per_cu;        // 每个CU最大wave数
+
+    static GPUInfo query(int device_id = 0)
+    {
+        GPUInfo info;
+        info.device_id = device_id;
+
+        hipDeviceProp_t prop;
+        HIP_CHECK(hipGetDeviceProperties(&prop, device_id));
+
+        info.device_name           = prop.name;
+        info.compute_units         = prop.multiProcessorCount;
+        info.max_threads_per_block = prop.maxThreadsPerBlock;
+        info.warp_size             = prop.warpSize;
+        info.total_global_mem      = prop.totalGlobalMem;
+        info.shared_mem_per_block  = prop.sharedMemPerBlock;
+        info.multiprocessor_count  = prop.multiProcessorCount;
+
+        // AMD GPU特定属性
+        // 每个CU通常可以同时运行多个wavefront
+        // MI300系列每个CU有4个SIMD单元，每个SIMD可以运行10个wavefronts
+        info.max_waves_per_cu   = 40; // MI300的典型值
+        info.max_threads_per_cu = info.max_waves_per_cu * info.warp_size;
+
+        // 估算每个CU可以同时运行的blocks数
+        // 这取决于每个block的资源使用情况
+        info.max_blocks_per_cu = 8; // 保守估计
+
+        return info;
+    }
+
+    void print() const
+    {
+        std::cout << "\n========== GPU Hardware Information ==========" << std::endl;
+        std::cout << "Device ID: " << device_id << std::endl;
+        std::cout << "Device Name: " << device_name << std::endl;
+        std::cout << "Compute Units (CUs): " << compute_units << std::endl;
+        std::cout << "Max Threads per Block: " << max_threads_per_block << std::endl;
+        std::cout << "Warp/Wavefront Size: " << warp_size << std::endl;
+        std::cout << "Max Waves per CU: " << max_waves_per_cu << std::endl;
+        std::cout << "Max Threads per CU: " << max_threads_per_cu << std::endl;
+        std::cout << "Estimated Max Blocks per CU: " << max_blocks_per_cu << std::endl;
+        std::cout << "Total Global Memory: " << std::fixed << std::setprecision(2)
+                  << total_global_mem / (1024.0 * 1024.0 * 1024.0) << " GB" << std::endl;
+        std::cout << "Shared Memory per Block: " << shared_mem_per_block / 1024 << " KB"
+                  << std::endl;
+        std::cout << "============================================\n" << std::endl;
+    }
+
+    // 根据GPU资源计算合理的tasks_per_block
+    // 目标：使总blocks数接近 CU数 * blocks_per_cu_target
+    int calculate_tasks_per_block(int total_tasks,
+                                  int threads_per_block,
+                                  float blocks_per_cu_target = 4.0f) const
+    {
+        // 目标blocks数：希望每个CU处理若干个blocks以保持充分利用
+        int target_blocks = static_cast<int>(compute_units * blocks_per_cu_target);
+
+        // 计算需要的tasks_per_block
+        // total_tasks = target_blocks * threads_per_block * tasks_per_block
+        int tasks_per_block = (total_tasks + target_blocks * threads_per_block - 1) /
+                              (target_blocks * threads_per_block);
+
+        // 限制在合理范围内
+        tasks_per_block = std::max(1, std::min(tasks_per_block, 32));
+
+        return tasks_per_block;
+    }
+};
+
 enum class CausalMaskType
 {
     DISABLE      = 0,
@@ -59,7 +142,7 @@ struct FmhaKernelConfig
     static constexpr enum CausalMaskType mask_type = MAKS_TYPE;
 };
 
-template <typename T, typename Config>
+template <typename T, typename Config, int TASKS_PER_BLOCK = 16>
 __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float scale)
 {
     constexpr int seq_q = Config::seq_q;
@@ -70,7 +153,7 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
     constexpr int head_dim          = Config::head_dim;
     constexpr int block_k           = 32;
     constexpr int thread_block_size = 64;
-    constexpr int tasks_per_block   = 16; // 每个block处理16个任务
+    constexpr int tasks_per_block   = TASKS_PER_BLOCK;
 
     int base_block_offset = blockIdx.x * thread_block_size * tasks_per_block;
     int thread_id         = threadIdx.x;
@@ -254,14 +337,14 @@ __global__ void apply_mask_and_softmax_kernel(T* scores, const T* dropout_mask, 
     }
 }
 
-template <typename T, typename Config>
+template <typename T, typename Config, int TASKS_PER_BLOCK = 16>
 __global__ void compute_output_kernel(const T* attn_weights, const T* V, T* O)
 {
     constexpr int seq_q                       = Config::seq_q;
     constexpr int seq_kv                      = Config::seq_kv;
     constexpr int head_dim                    = Config::head_dim;
     constexpr int warp_size                   = 64;
-    constexpr int tasks_per_block             = 16; // 每个block处理16个任务
+    constexpr int tasks_per_block             = TASKS_PER_BLOCK;
     constexpr int process_head_dim_per_thread = head_dim / warp_size;
 
     const uint32_t thread_id = threadIdx.x;
@@ -322,6 +405,12 @@ __global__ void compute_output_kernel(const T* attn_weights, const T* V, T* O)
 template <typename T, typename Config>
 struct AttnForwardKernelLauncher
 {
+    // 存储GPU信息 - 使用懒加载模式
+    static GPUInfo& get_gpu_info()
+    {
+        static GPUInfo gpu_info = GPUInfo::query();
+        return gpu_info;
+    }
 
     static size_t calc_workspace_size()
     {
@@ -354,31 +443,115 @@ struct AttnForwardKernelLauncher
         float scale            = sqr_dk_scale;
         float dropout_scale    = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
 
-        // Kernel 1: 每个block 64线程处理16个任务
-        constexpr int kernel1_threads         = 64;
-        constexpr int kernel1_tasks_per_block = 16;
-        dim3 grid((merge_bs + kernel1_threads * kernel1_tasks_per_block - 1) /
-                  (kernel1_threads * kernel1_tasks_per_block));
-        dim3 block(kernel1_threads);
+        // 获取GPU信息
+        GPUInfo& gpu_info = get_gpu_info();
 
-        // Step 1: Compute scores = Q @ K^T / sqrt(d_k)
-        compute_scores_kernel<T, Config><<<grid, block>>>(Q, K, workspace, scale);
+        // 根据GPU资源动态计算tasks_per_block
+        constexpr int kernel1_threads = 64;
+        int kernel1_tasks_per_block =
+            gpu_info.calculate_tasks_per_block(merge_bs, kernel1_threads, 4.0f);
+
+        std::cout << "Kernel 1 (compute_scores): " << std::endl;
+        std::cout << "  Total tasks: " << merge_bs << std::endl;
+        std::cout << "  Threads per block: " << kernel1_threads << std::endl;
+        std::cout << "  Tasks per block: " << kernel1_tasks_per_block << std::endl;
+
+        // 根据tasks_per_block选择对应的kernel实例化
+        dim3 block(kernel1_threads);
+        if(kernel1_tasks_per_block <= 1)
+        {
+            dim3 grid(merge_bs / kernel1_threads);
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_kernel<T, Config, 1><<<grid, block>>>(Q, K, workspace, scale);
+        }
+        else if(kernel1_tasks_per_block <= 2)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 2 - 1) / (kernel1_threads * 2));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_kernel<T, Config, 2><<<grid, block>>>(Q, K, workspace, scale);
+        }
+        else if(kernel1_tasks_per_block <= 4)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 4 - 1) / (kernel1_threads * 4));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_kernel<T, Config, 4><<<grid, block>>>(Q, K, workspace, scale);
+        }
+        else if(kernel1_tasks_per_block <= 8)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 8 - 1) / (kernel1_threads * 8));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_kernel<T, Config, 8><<<grid, block>>>(Q, K, workspace, scale);
+        }
+        else if(kernel1_tasks_per_block <= 16)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 16 - 1) / (kernel1_threads * 16));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_kernel<T, Config, 16><<<grid, block>>>(Q, K, workspace, scale);
+        }
+        else
+        {
+            dim3 grid((merge_bs + kernel1_threads * 32 - 1) / (kernel1_threads * 32));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_kernel<T, Config, 32><<<grid, block>>>(Q, K, workspace, scale);
+        }
 
         // Step 2: Apply mask and softmax (with dropout)
         constexpr int work_thread_num =
             Config::step2_block_size / (seq_q * seq_kv) * (seq_q * seq_kv);
         dim3 grid2((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
         dim3 block2(Config::step2_block_size);
+        std::cout << "Kernel 2 (apply_mask_and_softmax): " << std::endl;
+        std::cout << "  Grid size: " << grid2.x << " blocks" << std::endl;
         apply_mask_and_softmax_kernel<T, Config>
             <<<grid2, block2>>>(workspace, dropout_mask, dropout_scale);
 
-        // Kernel 3: 每个block 64线程处理16个任务
-        constexpr int kernel3_threads         = 64;
-        constexpr int kernel3_tasks_per_block = 16;
-        dim3 grid3((merge_bs + kernel3_tasks_per_block - 1) / kernel3_tasks_per_block);
+        // 根据GPU资源动态计算kernel3的tasks_per_block
+        constexpr int kernel3_threads = 64;
+        int kernel3_tasks_per_block =
+            gpu_info.calculate_tasks_per_block(merge_bs, kernel3_threads, 4.0f);
+
+        std::cout << "Kernel 3 (compute_output): " << std::endl;
+        std::cout << "  Total tasks: " << merge_bs << std::endl;
+        std::cout << "  Threads per block: " << kernel3_threads << std::endl;
+        std::cout << "  Tasks per block: " << kernel3_tasks_per_block << std::endl;
+
         dim3 block3(kernel3_threads);
-        // // Step 3: Compute output = attn_weights @ V
-        compute_output_kernel<T, Config><<<grid3, block3>>>(workspace, V, O);
+        if(kernel3_tasks_per_block <= 1)
+        {
+            dim3 grid3(merge_bs);
+            std::cout << "  Grid size: " << grid3.x << " blocks" << std::endl;
+            compute_output_kernel<T, Config, 1><<<grid3, block3>>>(workspace, V, O);
+        }
+        else if(kernel3_tasks_per_block <= 2)
+        {
+            dim3 grid3((merge_bs + 2 - 1) / 2);
+            std::cout << "  Grid size: " << grid3.x << " blocks" << std::endl;
+            compute_output_kernel<T, Config, 2><<<grid3, block3>>>(workspace, V, O);
+        }
+        else if(kernel3_tasks_per_block <= 4)
+        {
+            dim3 grid3((merge_bs + 4 - 1) / 4);
+            std::cout << "  Grid size: " << grid3.x << " blocks" << std::endl;
+            compute_output_kernel<T, Config, 4><<<grid3, block3>>>(workspace, V, O);
+        }
+        else if(kernel3_tasks_per_block <= 8)
+        {
+            dim3 grid3((merge_bs + 8 - 1) / 8);
+            std::cout << "  Grid size: " << grid3.x << " blocks" << std::endl;
+            compute_output_kernel<T, Config, 8><<<grid3, block3>>>(workspace, V, O);
+        }
+        else if(kernel3_tasks_per_block <= 16)
+        {
+            dim3 grid3((merge_bs + 16 - 1) / 16);
+            std::cout << "  Grid size: " << grid3.x << " blocks" << std::endl;
+            compute_output_kernel<T, Config, 16><<<grid3, block3>>>(workspace, V, O);
+        }
+        else
+        {
+            dim3 grid3((merge_bs + 32 - 1) / 32);
+            std::cout << "  Grid size: " << grid3.x << " blocks" << std::endl;
+            compute_output_kernel<T, Config, 32><<<grid3, block3>>>(workspace, V, O);
+        }
     }
 };
 
@@ -854,12 +1027,17 @@ struct TestRunner<MAX_SEQ_KV, MAX_SEQ_KV>
 
 int main(int argc, char const* argv[])
 {
-    std::cout << "\n========== Testing with bfloat16 (SEQ_KV from 4 to 16) ==========" << std::endl;
+    // 查询并打印GPU硬件信息
+    GPUInfo gpu_info = GPUInfo::query();
+    gpu_info.print();
 
-    // Using template metaprogramming to generate tests for SEQ_KV from 4 to 16
+    std::cout << "========== Testing with bfloat16 (SEQ_KV from 4 to 16, step 4) =========="
+              << std::endl;
+
+    // Using template metaprogramming to generate tests for SEQ_KV from 4 to 16 with step 4
     // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
     // ENABLE_DROPOUT_MASK, MASK_TYPE
-    TestRunner<2, 2>::run<hip_bfloat16, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
+    TestRunner<2, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
         0, // dropout_p
         5, // warmup_iters
         3, // test_iters
