@@ -27,7 +27,6 @@
         }                                                                                  \
     } while(0)
 
-
 enum class CausalMaskType
 {
     DISABLE      = 0,
@@ -65,8 +64,6 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
 {
     constexpr int seq_q = Config::seq_q;
     static_assert(seq_q == 1, "seq_q must be 1 for this kernel implementation.");
-    // static_assert(std::is_same<T, hip_bfloat16>::value,
-    //               "This kernel only supports hip_bfloat16 data type.");
     constexpr int seq_kv            = Config::seq_kv;
     constexpr int head_dim          = Config::head_dim;
     constexpr int block_k           = 64;
@@ -76,27 +73,37 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
     int base_block_offset = blockIdx.x * thread_block_size * tasks_per_block;
     int thread_id         = threadIdx.x;
 
-    // 循环处理多个任务
     for(int task = 0; task < tasks_per_block; task++)
     {
         int cur_batch_idx = base_block_offset + task * thread_block_size + thread_id;
+        // Layout: [batch, seq_len, head_num, head_dim]
+        // cur_batch_idx represents the combined index for (batch * seq_q(equal to 1) * head_num)
+        int batch_idx    = cur_batch_idx / (Config::seq_q * Config::head_num);
+        int seq_head_idx = cur_batch_idx % (Config::seq_q * Config::head_num);
+        int seq_idx      = seq_head_idx / Config::head_num;
+        int head_idx     = seq_head_idx % Config::head_num;
+
         float results[seq_kv];
         T fetch_Q[block_k];
         T fetch_K[block_k];
-        T* Q_ptr     = (T*)&Q[cur_batch_idx * head_dim];
-        T* K_ptr     = (T*)&K[cur_batch_idx * head_dim * seq_kv];
+        // Q: [batch, seq_q, head_num, head_dim]
+        T* Q_ptr = (T*)&Q[(batch_idx * Config::seq_q * Config::head_num +
+                           seq_idx * Config::head_num + head_idx) *
+                          head_dim];
+        // K: [batch, seq_kv, head_num, head_dim]
+        T* K_ptr     = (T*)&K[(batch_idx * seq_kv * Config::head_num + head_idx) * head_dim];
         T* score_ptr = (T*)&scores[cur_batch_idx * seq_kv];
         uint4 ls_dwordx4_tmp_var;
 #pragma unroll
         for(int i = 0; i < seq_kv; i++)
             results[i] = 0.0f;
-        for(int head_idx = 0; head_idx < head_dim; head_idx += block_k)
+        for(int dim_offset = 0; dim_offset < head_dim; dim_offset += block_k)
         {
             if constexpr(std::is_same<T, hip_bfloat16>::value)
             {
                 for(int k = 0; k < block_k / 8; k++)
                 {
-                    ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[head_idx + k * 8]);
+                    ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[dim_offset + k * 8]);
                     fetch_Q[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
                     fetch_Q[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
                     fetch_Q[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
@@ -110,8 +117,9 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
                 {
                     for(int k = 0; k < block_k / 8; k++)
                     {
-                        ls_dwordx4_tmp_var =
-                            *((uint4*)&K_ptr[kv_idx * head_dim + head_idx + k * 8]);
+                        // K layout: [batch, seq_kv, head_num, head_dim]
+                        ls_dwordx4_tmp_var = *((uint4*)&K_ptr[kv_idx * Config::head_num * head_dim +
+                                                              dim_offset + k * 8]);
                         fetch_K[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
                         fetch_K[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
                         fetch_K[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
@@ -133,7 +141,7 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
             {
                 for(int k = 0; k < block_k / 4; k++)
                 {
-                    ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[head_idx + k * 4]);
+                    ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[dim_offset + k * 4]);
                     fetch_Q[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
                     fetch_Q[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
                     fetch_Q[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
@@ -143,8 +151,9 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
                 {
                     for(int k = 0; k < block_k / 4; k++)
                     {
-                        ls_dwordx4_tmp_var =
-                            *((uint4*)&K_ptr[kv_idx * head_dim + head_idx + k * 4]);
+                        // K layout: [batch, seq_kv, head_num, head_dim]
+                        ls_dwordx4_tmp_var = *((uint4*)&K_ptr[kv_idx * Config::head_num * head_dim +
+                                                              dim_offset + k * 4]);
                         fetch_K[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
                         fetch_K[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
                         fetch_K[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
@@ -277,10 +286,16 @@ __global__ void compute_output_kernel(const T* attn_weights, const T* V, T* O)
     T result[block_k];
     T attn[seq_kv];
 
-    // 每个 block 循环处理多个任务以减少总 block 数
     for(int task = 0; task < tasks_per_block; task++)
     {
         int block_batch_head_idx = base_block_offset + task * process_head_per_warp;
+        int cur_idx              = block_batch_head_idx + thread_batch_offset;
+
+        // Layout: [batch, seq_len, head_num, head_dim]
+        int batch_idx    = cur_idx / (Config::seq_q * Config::head_num);
+        int seq_head_idx = cur_idx % (Config::seq_q * Config::head_num);
+        int seq_q_idx    = seq_head_idx / Config::head_num;
+        int head_idx     = seq_head_idx % Config::head_num;
 
 #pragma unroll
         for(int i = 0; i < block_k / dwordx4_load_elt; i++)
@@ -293,16 +308,18 @@ __global__ void compute_output_kernel(const T* attn_weights, const T* V, T* O)
         // ((T *)&store_dwordx4_tmp_var)[i] = 0.0f;
 #pragma unroll
         for(int i = 0; i < seq_kv; i++)
-            attn[i] = attn_weights[(block_batch_head_idx + thread_batch_offset) * seq_kv + i];
+            attn[i] = attn_weights[cur_idx * seq_kv + i];
 #pragma unroll
         for(int j = 0; j < seq_kv; j++)
         {
 #pragma unroll
             for(int i = 0; i < block_k / dwordx4_load_elt; i++)
             {
-                load_dwordx4_tmp_var[i] =
-                    *((uint4*)&V[(block_batch_head_idx + thread_batch_offset) * seq_kv * head_dim +
-                                 j * head_dim + thread_head_offset + i * dwordx4_load_elt]);
+                // V layout: [batch, seq_kv, head_num, head_dim]
+                load_dwordx4_tmp_var[i] = *((uint4*)&V[(batch_idx * seq_kv * Config::head_num +
+                                                        j * Config::head_num + head_idx) *
+                                                           head_dim +
+                                                       thread_head_offset + i * dwordx4_load_elt]);
             }
 #pragma unroll
             for(int b = 0; b < block_k; b++)
@@ -312,8 +329,11 @@ __global__ void compute_output_kernel(const T* attn_weights, const T* V, T* O)
         }
 #pragma unroll
         for(int i = 0; i < block_k / dwordx4_load_elt; i++)
-            *((uint4*)&O[(block_batch_head_idx + thread_batch_offset) * head_dim +
-                         i * dwordx4_load_elt + thread_head_offset]) = store_dwordx4_tmp_var[i];
+            // O layout: [batch, seq_q, head_num, head_dim]
+            *((uint4*)&O[(batch_idx * Config::seq_q * Config::head_num +
+                          seq_q_idx * Config::head_num + head_idx) *
+                             head_dim +
+                         thread_head_offset + i * dwordx4_load_elt]) = store_dwordx4_tmp_var[i];
     }
 }
 
@@ -375,38 +395,6 @@ struct AttnForwardKernelLauncher
     }
 };
 
-// Helper function: Matrix multiplication C = A @ B
-// A: [rows_a, cols_a], B: [cols_a, cols_b], C: [rows_a, cols_b]
-template <typename T>
-void matmul(const T* A, const T* B, T* C, int rows_a, int cols_a, int cols_b)
-{
-    for(int i = 0; i < rows_a; i++)
-    {
-        for(int j = 0; j < cols_b; j++)
-        {
-            float sum = 0.0f;
-            for(int k = 0; k < cols_a; k++)
-            {
-                sum += float(A[i * cols_a + k]) * float(B[k * cols_b + j]);
-            }
-            C[i * cols_b + j] = T(sum);
-        }
-    }
-}
-
-// Helper function: Matrix transpose
-template <typename T>
-void transpose(const T* A, T* A_T, int rows, int cols)
-{
-    for(int i = 0; i < rows; i++)
-    {
-        for(int j = 0; j < cols; j++)
-        {
-            A_T[j * rows + i] = A[i * cols + j];
-        }
-    }
-}
-
 /**
  * Multi-Head Attention Forward Pass (CPU Reference Implementation)
  */
@@ -442,107 +430,114 @@ void attn_forward(const T* Q,
     }
 
     // Process each batch and head
+    // Layout: [batch, seq_len, head_num, head_dim]
     for(int b = 0; b < batch; b++)
     {
         for(int h = 0; h < head_num; h++)
         {
-            int offset_Q       = (b * head_num + h) * q_seq * head_dim;
-            int offset_K       = (b * head_num + h) * kv_seq * head_dim;
-            int offset_V       = (b * head_num + h) * kv_seq * head_dim;
-            int offset_O       = (b * head_num + h) * q_seq * head_dim;
-            int offset_attn    = (b * head_num + h) * q_seq * kv_seq;
-            int offset_dropout = dropout_mask ? (b * head_num + h) * q_seq * kv_seq : 0;
-
-            const T* Q_bh       = Q + offset_Q;
-            const T* K_bh       = K + offset_K;
-            const T* V_bh       = V + offset_V;
-            const T* dropout_bh = dropout_mask ? dropout_mask + offset_dropout : nullptr;
-
-            T* O_bh    = O + offset_O;
-            T* attn_bh = attn_weights ? attn_weights + offset_attn : nullptr;
-
-            // Step 1: Compute scores = Q @ K^T / sqrt(d_k)
-            // Q: [q_seq, head_dim], K: [kv_seq, head_dim] -> scores: [q_seq, kv_seq]
-            transpose(K_bh, K_T.data(), kv_seq, head_dim);
-            matmul(Q_bh, K_T.data(), scores.data(), q_seq, head_dim, kv_seq);
-
-            for(int i = 0; i < q_seq * kv_seq; i++)
+            // For each query position
+            for(int q_idx = 0; q_idx < q_seq; q_idx++)
             {
-                scores[i] = T(float(scores[i]) * scale);
-            }
+                int offset_Q    = (b * q_seq * head_num + q_idx * head_num + h) * head_dim;
+                int offset_O    = (b * q_seq * head_num + q_idx * head_num + h) * head_dim;
+                int offset_attn = (b * q_seq * head_num + q_idx * head_num + h) * kv_seq;
+                int offset_dropout =
+                    dropout_mask ? (b * q_seq * head_num + q_idx * head_num + h) * kv_seq : 0;
 
-            // Step 2: Apply causal mask
-            if(mask_type == CausalMaskType::TOP_LEFT)
-            {
-                for(int i = 0; i < q_seq; i++)
+                const T* Q_ptr       = Q + offset_Q;
+                const T* dropout_ptr = dropout_mask ? dropout_mask + offset_dropout : nullptr;
+
+                T* O_ptr    = O + offset_O;
+                T* attn_ptr = attn_weights ? attn_weights + offset_attn : nullptr;
+
+                // Step 1: Compute scores = Q @ K^T / sqrt(d_k)
+                // Q: [1, head_dim], K: [kv_seq, head_dim] -> scores: [1, kv_seq]
+                // Build K matrix for this head: K is [batch, kv_seq, head_num, head_dim]
+                for(int kv_idx = 0; kv_idx < kv_seq; kv_idx++)
+                {
+                    int k_offset   = (b * kv_seq * head_num + kv_idx * head_num + h) * head_dim;
+                    const T* K_ptr = K + k_offset;
+                    float sum      = 0.0f;
+                    for(int d = 0; d < head_dim; d++)
+                    {
+                        sum += float(Q_ptr[d]) * float(K_ptr[d]);
+                    }
+                    scores[kv_idx] = T(sum * scale);
+                }
+
+                // Step 2: Apply causal mask
+                if(mask_type == CausalMaskType::TOP_LEFT)
                 {
                     for(int j = 0; j < kv_seq; j++)
                     {
-                        if(j > i)
+                        if(j > q_idx)
                         {
-                            scores[i * kv_seq + j] = T(-1e9f);
+                            scores[j] = T(-1e9f);
                         }
                     }
                 }
-            }
-            else if(mask_type == CausalMaskType::BOTTOM_RIGHT)
-            {
-                for(int i = 0; i < q_seq; i++)
+                else if(mask_type == CausalMaskType::BOTTOM_RIGHT)
                 {
                     for(int j = 0; j < kv_seq; j++)
                     {
-                        if(j < i)
+                        if(j < q_idx)
                         {
-                            scores[i * kv_seq + j] = T(-1e9f);
+                            scores[j] = T(-1e9f);
                         }
                     }
                 }
-            }
 
-            // Step 3: Softmax
-            for(int i = 0; i < q_seq; i++)
-            {
+                // Step 3: Softmax
                 // Find max for numerical stability
                 float max_val = -1e9f;
                 for(int j = 0; j < kv_seq; j++)
                 {
-                    max_val = std::max(max_val, float(scores[i * kv_seq + j]));
+                    max_val = std::max(max_val, float(scores[j]));
                 }
 
                 // Compute exp and sum
                 float sum = 0.0f;
                 for(int j = 0; j < kv_seq; j++)
                 {
-                    attn_probs[i * kv_seq + j] =
-                        T(std::exp(float(scores[i * kv_seq + j]) - max_val));
-                    sum += float(attn_probs[i * kv_seq + j]);
+                    attn_probs[j] = T(std::exp(float(scores[j]) - max_val));
+                    sum += float(attn_probs[j]);
                 }
 
                 // Normalize
                 for(int j = 0; j < kv_seq; j++)
                 {
-                    attn_probs[i * kv_seq + j] = T(float(attn_probs[i * kv_seq + j]) / sum);
+                    attn_probs[j] = T(float(attn_probs[j]) / sum);
                 }
-            }
 
-            // Step 4: Apply dropout
-            if(dropout_p > 0.0f && dropout_bh != nullptr)
-            {
-                for(int i = 0; i < q_seq * kv_seq; i++)
+                // Step 4: Apply dropout
+                if(dropout_p > 0.0f && dropout_ptr != nullptr)
                 {
-                    attn_probs[i] = T(float(attn_probs[i]) * float(dropout_bh[i]) * dropout_scale);
+                    for(int i = 0; i < kv_seq; i++)
+                    {
+                        attn_probs[i] =
+                            T(float(attn_probs[i]) * float(dropout_ptr[i]) * dropout_scale);
+                    }
+                }
+
+                // Save attention weights if requested
+                if(attn_ptr != nullptr)
+                {
+                    std::memcpy(attn_ptr, attn_probs.data(), kv_seq * sizeof(T));
+                }
+
+                // Step 5: Compute output = attn_probs @ V
+                // attn_probs: [1, kv_seq], V: [kv_seq, head_dim] -> O: [1, head_dim]
+                for(int d = 0; d < head_dim; d++)
+                {
+                    float sum = 0.0f;
+                    for(int kv_idx = 0; kv_idx < kv_seq; kv_idx++)
+                    {
+                        int v_offset = (b * kv_seq * head_num + kv_idx * head_num + h) * head_dim;
+                        sum += float(attn_probs[kv_idx]) * float(V[v_offset + d]);
+                    }
+                    O_ptr[d] = T(sum);
                 }
             }
-
-            // Save attention weights if requested
-            if(attn_bh != nullptr)
-            {
-                std::memcpy(attn_bh, attn_probs.data(), q_seq * kv_seq * sizeof(T));
-            }
-
-            // Step 5: Compute output = attn_probs @ V
-            // attn_probs: [q_seq, kv_seq], V: [kv_seq, head_dim] -> O: [q_seq, head_dim]
-            matmul(attn_probs.data(), V_bh, O_bh, q_seq, kv_seq, head_dim);
         }
     }
 }
@@ -847,8 +842,6 @@ struct TestRunner<MAX_SEQ_KV, MAX_SEQ_KV>
 
 int main(int argc, char const* argv[])
 {
-    gpu_info.print();
-
     std::cout << "========== Testing with bfloat16 (SEQ_KV from 4 to 16, step 4) =========="
               << std::endl;
 
