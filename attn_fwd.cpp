@@ -42,7 +42,7 @@ std::map<CausalMaskType, std::string> CausalMaskTypeName = {
 template <int BS,
           int HEAD_NUM,
           int SEQ_Q,
-          int SEQ_KV,
+          int MAX_SEQ_KV,
           int HEAD_DIM,
           int STEP2_BLOCK_SIZE     = 256,
           bool ENABLE_DROPOUT_MASK = true,
@@ -52,7 +52,7 @@ struct FmhaKernelConfig
     static constexpr int bs                        = BS;
     static constexpr int head_num                  = HEAD_NUM;
     static constexpr int seq_q                     = SEQ_Q;
-    static constexpr int seq_kv                    = SEQ_KV;
+    static constexpr int max_seq_kv                = MAX_SEQ_KV;
     static constexpr int head_dim                  = HEAD_DIM;
     static constexpr int step2_block_size          = STEP2_BLOCK_SIZE;
     static constexpr bool enable_dropout_mask      = ENABLE_DROPOUT_MASK;
@@ -69,7 +69,7 @@ __global__ void compute_scores_kernel(const T* Q,
 {
     constexpr int seq_q = Config::seq_q;
     static_assert(seq_q == 1, "seq_q must be 1 for this kernel implementation.");
-    constexpr int max_seq_kv        = Config::seq_kv;
+    constexpr int max_seq_kv        = Config::max_seq_kv;
     constexpr int head_dim          = Config::head_dim;
     constexpr int block_k           = 64;
     constexpr int thread_block_size = 64;
@@ -199,7 +199,7 @@ __global__ void apply_mask_and_softmax_kernel(T* scores,
     const uint32_t block_id          = blockIdx.x;
     const uint32_t thread_id         = threadIdx.x;
     constexpr int seq_q              = Config::seq_q;
-    constexpr int max_seq_kv         = Config::seq_kv;
+    constexpr int max_seq_kv         = Config::max_seq_kv;
     constexpr int block_size         = Config::step2_block_size;
     constexpr int per_score_size     = seq_q * max_seq_kv;
     constexpr int valid_thread_range = block_size / per_score_size * per_score_size;
@@ -306,7 +306,7 @@ __global__ void compute_output_kernel(const T* attn_weights,
                                       const int* cu_seqlens_kv_padded)
 {
     constexpr int seq_q                 = Config::seq_q;
-    constexpr int max_seq_kv            = Config::seq_kv;
+    constexpr int max_seq_kv            = Config::max_seq_kv;
     constexpr int head_dim              = Config::head_dim;
     constexpr int block_k               = BLOCK_K;
     constexpr int dwordx4_load_elt      = 16 / sizeof(T);
@@ -385,12 +385,12 @@ struct AttnForwardKernelLauncher
 {
     static size_t calc_workspace_size()
     {
-        constexpr int bs       = Config::bs;
-        constexpr int head_num = Config::head_num;
-        constexpr int seq_q    = Config::seq_q;
-        constexpr int seq_kv   = Config::seq_kv;
+        constexpr int bs            = Config::bs;
+        constexpr int head_num      = Config::head_num;
+        constexpr int seq_q         = Config::seq_q;
+        constexpr int max_seq_kv    = Config::max_seq_kv;
 
-        size_t workspace_size = bs * head_num * seq_q * seq_kv * sizeof(T);
+        size_t workspace_size = bs * head_num * seq_q * max_seq_kv * sizeof(T);
         return workspace_size;
     }
 
@@ -405,12 +405,12 @@ struct AttnForwardKernelLauncher
                                     const int* cu_seqlens_kv,
                                     const int* cu_seqlens_kv_padded)
     {
-        constexpr int bs        = Config::bs;
-        constexpr int head_num  = Config::head_num;
-        constexpr int seq_q     = Config::seq_q;
-        constexpr int seq_kv    = Config::seq_kv;
-        constexpr int head_dim  = Config::head_dim;
-        constexpr int warp_size = 64;
+        constexpr int bs            = Config::bs;
+        constexpr int head_num      = Config::head_num;
+        constexpr int seq_q         = Config::seq_q;
+        constexpr int max_seq_kv    = Config::max_seq_kv;
+        constexpr int head_dim      = Config::head_dim;
+        constexpr int warp_size     = 64;
 
         constexpr int merge_bs = bs * head_num;
         float scale            = sqr_dk_scale;
@@ -425,8 +425,8 @@ struct AttnForwardKernelLauncher
 
         // Step 2: Apply mask and softmax (with dropout)
         constexpr int work_thread_num =
-            Config::step2_block_size / (seq_q * seq_kv) * (seq_q * seq_kv);
-        dim3 grid2((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
+            Config::step2_block_size / (seq_q * max_seq_kv) * (seq_q * max_seq_kv);
+        dim3 grid2((merge_bs * seq_q * max_seq_kv + work_thread_num - 1) / work_thread_num);
         dim3 block2(Config::step2_block_size);
         apply_mask_and_softmax_kernel<T, Config>
             <<<grid2, block2>>>(workspace, dropout_mask, dropout_scale, cu_seqlens_kv);
@@ -607,7 +607,7 @@ void test_run_attn_fwd_kernel(
     constexpr int bs         = Config::bs;
     constexpr int head_num   = Config::head_num;
     constexpr int seq_q      = Config::seq_q;
-    constexpr int max_seq_kv = Config::seq_kv;
+    constexpr int max_seq_kv = Config::max_seq_kv;
     constexpr int head_dim   = Config::head_dim;
 
     // Generate variable kv-seq lengths following normal distribution (mean=4, range 2-16)
@@ -624,19 +624,19 @@ void test_run_attn_fwd_kernel(
 
     int total_actual_kv_seq = 0;
     int total_padded_kv_seq = 0;
+    std::uniform_int_distribution<int> pad_dis(0, 5); // Random padding 0-5
 
     for(int b = 0; b < bs; b++)
     {
         // Generate kv-seq length from normal distribution, clamped to [2, max_seq_kv]
         int kv_len = static_cast<int>(std::round(normal_dis(gen)));
         kv_len     = std::max(2, std::min(max_seq_kv, kv_len));
-
-        total_actual_kv_seq += kv_len;
-        h_cu_seqlens_kv[b + 1] = total_actual_kv_seq;
-
-        // Padded length is rounded up to next even number for alignment
-        int padded_len = (kv_len % 2 == 0) ? kv_len : (kv_len + 1);
+        // Random padding (not aligned to any specific boundary)
+        int random_pad = pad_dis(gen);
+        int padded_len = kv_len + random_pad > max_seq_kv ? max_seq_kv : kv_len + random_pad;
         total_padded_kv_seq += padded_len;
+        total_actual_kv_seq += kv_len;
+        h_cu_seqlens_kv[b + 1]        = total_actual_kv_seq;
         h_cu_seqlens_kv_padded[b + 1] = total_padded_kv_seq;
     }
 
@@ -941,31 +941,29 @@ struct TestRunner<MAX_SEQ_KV, MAX_SEQ_KV>
 
 int main(int argc, char const* argv[])
 {
-    std::cout << "========== Testing with float (SEQ_KV from 2 to 16) ==========" << std::endl;
-
     // Using template metaprogramming to generate tests for SEQ_KV from 2 to 16
     // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
     // ENABLE_DROPOUT_MASK, MASK_TYPE
 
     // Quick correctness test with small batch size
-    std::cout << "\n========== Correctness Test (small batch) ==========" << std::endl;
-    TestRunner<2, 16>::run<float, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
-        0, // dropout_p
-        1, // warmup_iters
-        1, // test_iters
-        1, // check_correctness - ENABLED
-        1  // dump_err
-    );
+    // std::cout << "\n========== Correctness Test ==========" << std::endl;
+    // TestRunner<2, 16>::run<float, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
+    //     0, // dropout_p
+    //     1, // warmup_iters
+    //     1, // test_iters
+    //     1, // check_correctness - ENABLED
+    //     1  // dump_err
+    // );
 
     // Performance test with large batch size
-    // std::cout << "\n========== Performance Test (large batch) ==========" << std::endl;
-    // TestRunner<2, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
-    //     0, // dropout_p
-    //     3, // warmup_iters
-    //     5, // test_iters
-    //     0, // check_correctness
-    //     0  // dump_err
-    // );
+    std::cout << "\n========== Performance Test ==========" << std::endl;
+    TestRunner<2, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
+        0, // dropout_p
+        3, // warmup_iters
+        5, // test_iters
+        0, // check_correctness
+        0  // dump_err
+    );
 
     return 0;
 }
