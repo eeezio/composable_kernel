@@ -27,6 +27,88 @@
         }                                                                                  \
     } while(0)
 
+// GPU硬件信息结构体
+struct GPUInfo
+{
+    int device_id;
+    std::string device_name;
+    int compute_units;           // CU数量
+    int max_threads_per_block;   // 每个block最大线程数
+    int max_threads_per_cu;      // 每个CU最大线程数
+    int warp_size;               // Wavefront size
+    int max_blocks_per_cu;       // 每个CU可以同时运行的最大blocks数（估算）
+    size_t total_global_mem;     // 全局内存大小
+    size_t shared_mem_per_block; // 每个block的shared memory
+    int multiprocessor_count;    // 多处理器数量
+    int max_waves_per_cu;        // 每个CU最大wave数
+
+    static GPUInfo query(int device_id = 0)
+    {
+        GPUInfo info;
+        info.device_id = device_id;
+
+        hipDeviceProp_t prop;
+        HIP_CHECK(hipGetDeviceProperties(&prop, device_id));
+
+        info.device_name           = prop.name;
+        info.compute_units         = prop.multiProcessorCount;
+        info.max_threads_per_block = prop.maxThreadsPerBlock;
+        info.warp_size             = prop.warpSize;
+        info.total_global_mem      = prop.totalGlobalMem;
+        info.shared_mem_per_block  = prop.sharedMemPerBlock;
+        info.multiprocessor_count  = prop.multiProcessorCount;
+
+        // AMD GPU特定属性
+        // 每个CU通常可以同时运行多个wavefront
+        // MI300系列每个CU有4个SIMD单元，每个SIMD可以运行10个wavefronts
+        info.max_waves_per_cu   = 40; // MI300的典型值
+        info.max_threads_per_cu = info.max_waves_per_cu * info.warp_size;
+
+        // 估算每个CU可以同时运行的blocks数
+        // 这取决于每个block的资源使用情况
+        info.max_blocks_per_cu = 8; // 保守估计
+
+        return info;
+    }
+
+    void print() const
+    {
+        std::cout << "\n========== GPU Hardware Information ==========" << std::endl;
+        std::cout << "Device ID: " << device_id << std::endl;
+        std::cout << "Device Name: " << device_name << std::endl;
+        std::cout << "Compute Units (CUs): " << compute_units << std::endl;
+        std::cout << "Max Threads per Block: " << max_threads_per_block << std::endl;
+        std::cout << "Warp/Wavefront Size: " << warp_size << std::endl;
+        std::cout << "Max Waves per CU: " << max_waves_per_cu << std::endl;
+        std::cout << "Max Threads per CU: " << max_threads_per_cu << std::endl;
+        std::cout << "Estimated Max Blocks per CU: " << max_blocks_per_cu << std::endl;
+        std::cout << "Total Global Memory: " << std::fixed << std::setprecision(2)
+                  << total_global_mem / (1024.0 * 1024.0 * 1024.0) << " GB" << std::endl;
+        std::cout << "Shared Memory per Block: " << shared_mem_per_block / 1024 << " KB"
+                  << std::endl;
+        std::cout << "============================================\n" << std::endl;
+    }
+
+    // 根据GPU资源计算合理的tasks_per_block
+    // 目标：使总blocks数接近 CU数 * blocks_per_cu_target
+    int calculate_tasks_per_block(int total_tasks,
+                                  int threads_per_block,
+                                  float blocks_per_cu_target = 4.0f) const
+    {
+        // 目标blocks数：希望每个CU处理若干个blocks以保持充分利用
+        int target_blocks = static_cast<int>(compute_units * blocks_per_cu_target);
+
+        // 计算需要的tasks_per_block
+        // total_tasks = target_blocks * threads_per_block * tasks_per_block
+        int tasks_per_block = (total_tasks + target_blocks * threads_per_block - 1) /
+                              (target_blocks * threads_per_block);
+
+        // 限制在合理范围内
+        tasks_per_block = std::max(1, std::min(tasks_per_block, 32));
+
+        return tasks_per_block;
+    }
+};
 
 enum class CausalMaskType
 {
@@ -61,7 +143,13 @@ struct FmhaKernelConfig
 };
 
 template <typename T, typename Config, int TASKS_PER_BLOCK = 16>
-__global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float scale)
+__global__ void compute_scores_and_softmax_kernel(const T* Q,
+                                                  const T* K,
+                                                  const T* V,
+                                                  const T* dropout_mask,
+                                                  T* out,
+                                                  float scale,
+                                                  float dropout_scale)
 {
     constexpr int seq_q = Config::seq_q;
     static_assert(seq_q == 1, "seq_q must be 1 for this kernel implementation.");
@@ -69,7 +157,7 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
     //               "This kernel only supports hip_bfloat16 data type.");
     constexpr int seq_kv            = Config::seq_kv;
     constexpr int head_dim          = Config::head_dim;
-    constexpr int block_k           = 64;
+    constexpr int block_k           = 32;
     constexpr int thread_block_size = 64;
     constexpr int tasks_per_block   = TASKS_PER_BLOCK;
 
@@ -81,11 +169,14 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
     {
         int cur_batch_idx = base_block_offset + task * thread_block_size + thread_id;
         float results[seq_kv];
-        T fetch_Q[block_k];
-        T fetch_K[block_k];
-        T* Q_ptr     = (T*)&Q[cur_batch_idx * head_dim];
-        T* K_ptr     = (T*)&K[cur_batch_idx * head_dim * seq_kv];
-        T* score_ptr = (T*)&scores[cur_batch_idx * seq_kv];
+        T fetch_QO[block_k];
+        T fetch_KV[block_k];
+        T* Q_ptr   = (T*)&Q[cur_batch_idx * head_dim];
+        T* K_ptr   = (T*)&K[cur_batch_idx * head_dim * seq_kv];
+        T* V_ptr   = (T*)&V[cur_batch_idx * head_dim * seq_kv];
+        T* out_ptr = (T*)&out[cur_batch_idx * head_dim];
+        const T* dropout_ptr =
+            Config::enable_dropout_mask ? (T*)&dropout_mask[cur_batch_idx * seq_kv] : nullptr;
         uint4 ls_dwordx4_tmp_var;
 #pragma unroll
         for(int i = 0; i < seq_kv; i++)
@@ -96,15 +187,15 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
             {
                 for(int k = 0; k < block_k / 8; k++)
                 {
-                    ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[head_idx + k * 8]);
-                    fetch_Q[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
-                    fetch_Q[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
-                    fetch_Q[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
-                    fetch_Q[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
-                    fetch_Q[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
-                    fetch_Q[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
-                    fetch_Q[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
-                    fetch_Q[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
+                    ls_dwordx4_tmp_var  = *((uint4*)&Q_ptr[head_idx + k * 8]);
+                    fetch_QO[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
+                    fetch_QO[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
+                    fetch_QO[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
+                    fetch_QO[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
+                    fetch_QO[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
+                    fetch_QO[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
+                    fetch_QO[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
+                    fetch_QO[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
                 }
                 for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
                 {
@@ -112,20 +203,20 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
                     {
                         ls_dwordx4_tmp_var =
                             *((uint4*)&K_ptr[kv_idx * head_dim + head_idx + k * 8]);
-                        fetch_K[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
-                        fetch_K[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
-                        fetch_K[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
-                        fetch_K[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
-                        fetch_K[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
-                        fetch_K[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
-                        fetch_K[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
-                        fetch_K[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
+                        fetch_KV[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
+                        fetch_KV[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
+                        fetch_KV[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
+                        fetch_KV[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
+                        fetch_KV[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
+                        fetch_KV[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
+                        fetch_KV[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
+                        fetch_KV[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
                     }
 #pragma unroll
                     for(int k = 0; k < block_k; k++)
                     {
                         results[kv_idx] +=
-                            static_cast<float>(fetch_Q[k]) * static_cast<float>(fetch_K[k]);
+                            static_cast<float>(fetch_QO[k]) * static_cast<float>(fetch_KV[k]);
                     }
                 }
             }
@@ -133,11 +224,11 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
             {
                 for(int k = 0; k < block_k / 4; k++)
                 {
-                    ls_dwordx4_tmp_var = *((uint4*)&Q_ptr[head_idx + k * 4]);
-                    fetch_Q[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
-                    fetch_Q[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
-                    fetch_Q[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
-                    fetch_Q[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
+                    ls_dwordx4_tmp_var  = *((uint4*)&Q_ptr[head_idx + k * 4]);
+                    fetch_QO[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
+                    fetch_QO[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
+                    fetch_QO[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
+                    fetch_QO[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
                 }
                 for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
                 {
@@ -145,15 +236,15 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
                     {
                         ls_dwordx4_tmp_var =
                             *((uint4*)&K_ptr[kv_idx * head_dim + head_idx + k * 4]);
-                        fetch_K[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
-                        fetch_K[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
-                        fetch_K[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
-                        fetch_K[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
+                        fetch_KV[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
+                        fetch_KV[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
+                        fetch_KV[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
+                        fetch_KV[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
                     }
 #pragma unroll
                     for(int k = 0; k < block_k; k++)
                     {
-                        results[kv_idx] += fetch_Q[k] * fetch_K[k];
+                        results[kv_idx] += fetch_QO[k] * fetch_KV[k];
                     }
                 }
             }
@@ -161,165 +252,146 @@ __global__ void compute_scores_kernel(const T* Q, const T* K, T* scores, float s
 #pragma unroll
         for(int i = 0; i < seq_kv; i++)
         {
-            score_ptr[i] = T(results[i] * scale);
+            results[i] = results[i] * scale;
         }
-    }
-}
-
-template <typename T, typename Config>
-__global__ void apply_mask_and_softmax_kernel(T* scores, const T* dropout_mask, float dropout_scale)
-{
-    const uint32_t block_id          = blockIdx.x;
-    const uint32_t thread_id         = threadIdx.x;
-    constexpr int seq_q              = Config::seq_q;
-    constexpr int seq_kv             = Config::seq_kv;
-    constexpr int block_size         = Config::step2_block_size;
-    constexpr int per_score_size     = seq_q * seq_kv;
-    constexpr int valid_thread_range = block_size / per_score_size * per_score_size;
-    const uint32_t cur_block_offset  = block_id * valid_thread_range + thread_id;
-    constexpr uint32_t total_elt     = Config::bs * Config::head_num * seq_q * seq_kv;
-    bool is_tail                     = block_id * valid_thread_range + block_size >= total_elt;
-    int real_row_num = is_tail ? (total_elt - block_id * valid_thread_range) / seq_kv
-                               : valid_thread_range / seq_kv;
-
-    if(cur_block_offset < total_elt && thread_id < valid_thread_range)
-    {
-        __shared__ T tmp_scores[valid_thread_range];
-        constexpr int row_num = valid_thread_range / seq_kv;
-        __shared__ T row_max[row_num];
-        __shared__ T row_sum[row_num];
-
-        T score_value         = scores[cur_block_offset];
-        tmp_scores[thread_id] = score_value;
 
         // Apply causal mask before softmax
         if constexpr(Config::mask_type == CausalMaskType::TOP_LEFT)
         {
-            int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
-            int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
-            if(k_idx > q_idx)
+            int q_idx = 0; // seq_q == 1
+#pragma unroll
+            for(int k_idx = 0; k_idx < seq_kv; k_idx++)
             {
-                tmp_scores[thread_id] = T(-1e9f);
+                if(k_idx > q_idx)
+                {
+                    results[k_idx] = -1e9f;
+                }
             }
         }
         else if constexpr(Config::mask_type == CausalMaskType::BOTTOM_RIGHT)
         {
-            int q_idx = (cur_block_offset % (seq_q * seq_kv)) / seq_kv;
-            int k_idx = (cur_block_offset % (seq_q * seq_kv)) % seq_kv;
-            if(k_idx < q_idx)
+            int q_idx = 0; // seq_q == 1
+#pragma unroll
+            for(int k_idx = 0; k_idx < seq_kv; k_idx++)
             {
-                tmp_scores[thread_id] = T(-1e9f);
+                if(k_idx < q_idx)
+                {
+                    results[k_idx] = -1e9f;
+                }
             }
         }
-        __syncthreads();
 
-        // Find max for each row (numerically stable softmax)
-        if(thread_id < real_row_num)
-        {
-            T max_val = T(-1e9f);
-#pragma unroll
-            for(int i = 0; i < seq_kv; i++)
-            {
-                max_val = max(max_val, tmp_scores[thread_id * seq_kv + i]);
-            }
-            row_max[thread_id] = max_val;
-        }
-        __syncthreads();
-
-        // Compute exp(score - max) and sum for each row
-        T exp_val             = T(exp(float(tmp_scores[thread_id] - row_max[thread_id / seq_kv])));
-        tmp_scores[thread_id] = exp_val;
-        __syncthreads();
-
-        if(thread_id < real_row_num)
-        {
-            T sum = T(0.0f);
-#pragma unroll
-            for(int i = 0; i < seq_kv; i++)
-            {
-                sum += tmp_scores[thread_id * seq_kv + i];
-            }
-            row_sum[thread_id] = sum;
-        }
-        __syncthreads();
-
-        // Normalize and apply dropout
-        T attn_weight = tmp_scores[thread_id] / row_sum[thread_id / seq_kv];
-
-        if constexpr(Config::enable_dropout_mask)
-        {
-            attn_weight = attn_weight * dropout_mask[cur_block_offset] * dropout_scale;
-        }
-
-        scores[cur_block_offset] = attn_weight;
-    }
-}
-
-template <typename T, typename Config, int TASKS_PER_BLOCK = 1, int BLOCK_K = 8>
-__global__ void compute_output_kernel(const T* attn_weights, const T* V, T* O)
-{
-    constexpr int seq_q                 = Config::seq_q;
-    constexpr int seq_kv                = Config::seq_kv;
-    constexpr int head_dim              = Config::head_dim;
-    constexpr int block_k               = BLOCK_K;
-    constexpr int dwordx4_load_elt      = 16 / sizeof(T);
-    constexpr int warp_size             = 64;
-    constexpr int process_head_per_warp = warp_size / (head_dim / block_k);
-    constexpr int tasks_per_block       = TASKS_PER_BLOCK;
-
-    int base_block_offset   = blockIdx.x * process_head_per_warp * tasks_per_block;
-    int thread_id           = threadIdx.x;
-    int thread_batch_offset = thread_id / (head_dim / block_k);
-    int thread_head_offset  = thread_id % (head_dim / block_k) * block_k;
-
-    uint4 load_dwordx4_tmp_var[block_k / dwordx4_load_elt],
-        store_dwordx4_tmp_var[block_k / dwordx4_load_elt];
-    T result[block_k];
-    T attn[seq_kv];
-
-    // 每个 block 循环处理多个任务以减少总 block 数
-    for(int task = 0; task < tasks_per_block; task++)
-    {
-        int block_batch_head_idx = base_block_offset + task * process_head_per_warp;
-
-#pragma unroll
-        for(int i = 0; i < block_k / dwordx4_load_elt; i++)
-        {
-            store_dwordx4_tmp_var[i].x = 0;
-            store_dwordx4_tmp_var[i].y = 0;
-            store_dwordx4_tmp_var[i].z = 0;
-            store_dwordx4_tmp_var[i].w = 0;
-        }
-        // ((T *)&store_dwordx4_tmp_var)[i] = 0.0f;
+        // Softmax: Find max for numerical stability
+        float max_val = -1e9f;
 #pragma unroll
         for(int i = 0; i < seq_kv; i++)
-            attn[i] = attn_weights[(block_batch_head_idx + thread_batch_offset) * seq_kv + i];
-#pragma unroll
-        for(int j = 0; j < seq_kv; j++)
         {
-#pragma unroll
-            for(int i = 0; i < block_k / dwordx4_load_elt; i++)
-            {
-                load_dwordx4_tmp_var[i] =
-                    *((uint4*)&V[(block_batch_head_idx + thread_batch_offset) * seq_kv * head_dim +
-                                 j * head_dim + thread_head_offset + i * dwordx4_load_elt]);
-            }
-#pragma unroll
-            for(int b = 0; b < block_k; b++)
-                ((T*)&store_dwordx4_tmp_var[b / dwordx4_load_elt])[b % dwordx4_load_elt] +=
-                    attn[j] *
-                    ((T*)&load_dwordx4_tmp_var[b / dwordx4_load_elt])[b % dwordx4_load_elt];
+            max_val = max(max_val, results[i]);
         }
+
+        // Compute exp(score - max) and sum
+        float sum = 0.0f;
 #pragma unroll
-        for(int i = 0; i < block_k / dwordx4_load_elt; i++)
-            *((uint4*)&O[(block_batch_head_idx + thread_batch_offset) * head_dim +
-                         i * dwordx4_load_elt + thread_head_offset]) = store_dwordx4_tmp_var[i];
+        for(int i = 0; i < seq_kv; i++)
+        {
+            results[i] = exp(results[i] - max_val);
+            sum += results[i];
+        }
+
+        // Normalize and apply dropout
+#pragma unroll
+        for(int i = 0; i < seq_kv; i++)
+        {
+            results[i] /= sum;
+
+            if constexpr(Config::enable_dropout_mask)
+            {
+                results[i] = results[i] * static_cast<float>(dropout_ptr[i]) * dropout_scale;
+            }
+        }
+        // Compute output = attn_probs @ V
+        constexpr int pack_size = sizeof(T) == 2 ? 8 : 4;
+        T cvt_results[seq_kv];
+        if constexpr(std::is_same<T, hip_bfloat16>::value)
+        {
+            for(int i = 0; i < seq_kv; i++)
+            {
+                cvt_results[i] = T(results[i]);
+            }
+        }
+        for(int head_idx = 0; head_idx < head_dim; head_idx += block_k)
+        {
+            if constexpr(std::is_same<T, hip_bfloat16>::value)
+            {
+                // #pragma unroll
+                // for(int k = 0; k < block_k; k++)
+                // fetch_QO[k] = {0.0f};
+            }
+            else
+            {
+                fetch_QO[block_k] = {0.0f};
+            }
+            for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
+            {
+                if constexpr(std::is_same<T, hip_bfloat16>::value)
+                {
+                    for(int k = 0; k < block_k / 8; k++)
+                    {
+                        ls_dwordx4_tmp_var =
+                            *((uint4*)&V_ptr[kv_idx * head_dim + head_idx + k * 8]);
+                        fetch_KV[k * 8 + 0] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[0];
+                        fetch_KV[k * 8 + 1] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.x)[1];
+                        fetch_KV[k * 8 + 2] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[0];
+                        fetch_KV[k * 8 + 3] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.y)[1];
+                        fetch_KV[k * 8 + 4] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[0];
+                        fetch_KV[k * 8 + 5] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.z)[1];
+                        fetch_KV[k * 8 + 6] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[0];
+                        fetch_KV[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
+                    }
+#pragma unroll
+                    for(int k = 0; k < block_k; k++)
+                    {
+                        fetch_QO[k] += cvt_results[kv_idx] * fetch_KV[k];
+                    }
+                }
+                else
+                {
+                    for(int k = 0; k < block_k / 4; k++)
+                    {
+                        ls_dwordx4_tmp_var =
+                            *((uint4*)&V_ptr[kv_idx * head_dim + head_idx + k * 4]);
+                        fetch_KV[k * 4 + 0] = *((T*)&ls_dwordx4_tmp_var.x);
+                        fetch_KV[k * 4 + 1] = *((T*)&ls_dwordx4_tmp_var.y);
+                        fetch_KV[k * 4 + 2] = *((T*)&ls_dwordx4_tmp_var.z);
+                        fetch_KV[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
+                    }
+#pragma unroll
+                    for(int k = 0; k < block_k; k++)
+                    {
+                        fetch_QO[k] += results[kv_idx] * fetch_KV[k];
+                    }
+                }
+            }
+            for(int k = 0; k < block_k; k += pack_size)
+            {
+                *(uint4*)&out_ptr[head_idx + k] = *(uint4*)(&fetch_QO[k]);
+            }
+        }
     }
 }
+
+// Removed: apply_mask_and_softmax_kernel is now fused into compute_scores_and_softmax_kernel
 
 template <typename T, typename Config>
 struct AttnForwardKernelLauncher
 {
+    // 存储GPU信息 - 使用懒加载模式
+    static GPUInfo& get_gpu_info()
+    {
+        static GPUInfo gpu_info = GPUInfo::query();
+        return gpu_info;
+    }
+
     static size_t calc_workspace_size()
     {
         constexpr int bs       = Config::bs;
@@ -351,27 +423,63 @@ struct AttnForwardKernelLauncher
         float scale            = sqr_dk_scale;
         float dropout_scale    = (dropout_p > 0.0f) ? (1.0f / (1.0f - dropout_p)) : 1.0f;
 
+        // 获取GPU信息
+        GPUInfo& gpu_info = get_gpu_info();
+
+        // 根据GPU资源动态计算tasks_per_block
         constexpr int kernel1_threads = 64;
+        int kernel1_tasks_per_block =
+            gpu_info.calculate_tasks_per_block(merge_bs, kernel1_threads, 4.0f);
 
+        std::cout << "Kernel 1 (compute_scores_and_softmax): " << std::endl;
+        std::cout << "  Total tasks: " << merge_bs << std::endl;
+        std::cout << "  Threads per block: " << kernel1_threads << std::endl;
+        std::cout << "  Tasks per block: " << kernel1_tasks_per_block << std::endl;
+
+        // 根据tasks_per_block选择对应的kernel实例化
         dim3 block(kernel1_threads);
-        dim3 grid(merge_bs / kernel1_threads);
-        compute_scores_kernel<T, Config, 1><<<grid, block>>>(Q, K, workspace, scale);
-
-        // Step 2: Apply mask and softmax (with dropout)
-        constexpr int work_thread_num =
-            Config::step2_block_size / (seq_q * seq_kv) * (seq_q * seq_kv);
-        dim3 grid2((merge_bs * seq_q * seq_kv + work_thread_num - 1) / work_thread_num);
-        dim3 block2(Config::step2_block_size);
-        apply_mask_and_softmax_kernel<T, Config>
-            <<<grid2, block2>>>(workspace, dropout_mask, dropout_scale);
-
-        constexpr int kernel3_block_k       = 8;
-        constexpr int kernel3_threads       = 64;
-        constexpr int process_head_per_warp = warp_size / (head_dim / kernel3_block_k);
-
-        dim3 block3(kernel3_threads);
-        dim3 grid3((merge_bs / process_head_per_warp + 2 - 1) / 2);
-        compute_output_kernel<T, Config, 2, kernel3_block_k><<<grid3, block3>>>(workspace, V, O);
+        if(kernel1_tasks_per_block <= 1)
+        {
+            dim3 grid(merge_bs / kernel1_threads);
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_and_softmax_kernel<T, Config, 1>
+                <<<grid, block>>>(Q, K, V, dropout_mask, O, scale, dropout_scale);
+        }
+        else if(kernel1_tasks_per_block <= 2)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 2 - 1) / (kernel1_threads * 2));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_and_softmax_kernel<T, Config, 2>
+                <<<grid, block>>>(Q, K, V, dropout_mask, O, scale, dropout_scale);
+        }
+        else if(kernel1_tasks_per_block <= 4)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 4 - 1) / (kernel1_threads * 4));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_and_softmax_kernel<T, Config, 4>
+                <<<grid, block>>>(Q, K, V, dropout_mask, O, scale, dropout_scale);
+        }
+        else if(kernel1_tasks_per_block <= 8)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 8 - 1) / (kernel1_threads * 8));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_and_softmax_kernel<T, Config, 8>
+                <<<grid, block>>>(Q, K, V, dropout_mask, O, scale, dropout_scale);
+        }
+        else if(kernel1_tasks_per_block <= 16)
+        {
+            dim3 grid((merge_bs + kernel1_threads * 16 - 1) / (kernel1_threads * 16));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_and_softmax_kernel<T, Config, 16>
+                <<<grid, block>>>(Q, K, V, dropout_mask, O, scale, dropout_scale);
+        }
+        else
+        {
+            dim3 grid((merge_bs + kernel1_threads * 32 - 1) / (kernel1_threads * 32));
+            std::cout << "  Grid size: " << grid.x << " blocks" << std::endl;
+            compute_scores_and_softmax_kernel<T, Config, 32>
+                <<<grid, block>>>(Q, K, V, dropout_mask, O, scale, dropout_scale);
+        }
     }
 };
 
@@ -705,7 +813,7 @@ void test_run_attn_fwd_kernel(
             max_rel_diff   = std::max(max_rel_diff, rel_diff);
             if(rel_diff > tolerance)
             {
-                if(dump_err && diff_count < 100)
+                if(dump_err)
                     std::cout << name << " mismatch at index " << i << ": GPU=" << std::fixed
                               << std::setprecision(10) << static_cast<float>(gpu[i])
                               << ", CPU=" << std::fixed << std::setprecision(10)
@@ -847,6 +955,8 @@ struct TestRunner<MAX_SEQ_KV, MAX_SEQ_KV>
 
 int main(int argc, char const* argv[])
 {
+    // 查询并打印GPU硬件信息
+    GPUInfo gpu_info = GPUInfo::query();
     gpu_info.print();
 
     std::cout << "========== Testing with bfloat16 (SEQ_KV from 4 to 16, step 4) =========="
@@ -857,8 +967,8 @@ int main(int argc, char const* argv[])
     // ENABLE_DROPOUT_MASK, MASK_TYPE
     TestRunner<2, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
         0, // dropout_p
-        3, // warmup_iters
-        5, // test_iters
+        5, // warmup_iters
+        3, // test_iters
         0, // check_correctness
         0  // dump_err
     );
