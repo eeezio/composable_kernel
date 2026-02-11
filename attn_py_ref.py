@@ -125,10 +125,10 @@ def attn_backward(Q, K, V, grad_O, attn_weights, dropout_mask, dropout_p,
     Multi-Head Attention Backward Pass (Python Reference Implementation)
     
     Args:
-        Q: Query tensor [batch * head_num * q_seq * head_dim]
+        Q: Query tensor [batch * q_seq * head_num * head_dim] (flattened, q_seq=1 typically)
         K: Key tensor [total_padded_kv_seq * head_num * head_dim] (dynamic layout)
         V: Value tensor [total_padded_kv_seq * head_num * head_dim] (dynamic layout)
-        grad_O: Gradient of output [batch * head_num * q_seq * head_dim]
+        grad_O: Gradient of output [batch * q_seq * head_num * head_dim] (flattened, q_seq=1 typically)
         attn_weights: Attention weights [batch * head_num * q_seq * max_kv_seq]
         dropout_mask: Dropout mask [batch * head_num * q_seq * max_kv_seq] or None
         dropout_p: Dropout probability
@@ -143,7 +143,7 @@ def attn_backward(Q, K, V, grad_O, attn_weights, dropout_mask, dropout_p,
         total_padded_kv_seq: Total padded key/value sequence length
     
     Returns:
-        grad_Q: Gradient of Q [batch * head_num * q_seq * head_dim]
+        grad_Q: Gradient of Q [batch * q_seq * head_num * head_dim] (flattened, q_seq=1 typically)
         grad_K: Gradient of K [total_padded_kv_seq * head_num * head_dim]
         grad_V: Gradient of V [total_padded_kv_seq * head_num * head_dim]
     """
@@ -152,7 +152,7 @@ def attn_backward(Q, K, V, grad_O, attn_weights, dropout_mask, dropout_p,
     dropout_scale = 1.0 / (1.0 - dropout_p) if dropout_p > 0.0 else 1.0
     
     # Initialize gradients to zero
-    grad_Q = np.zeros(batch * head_num * q_seq * head_dim, dtype=Q.dtype)
+    grad_Q = np.zeros(batch * q_seq * head_num * head_dim, dtype=Q.dtype)
     grad_K = np.zeros(total_padded_kv_seq * head_num * head_dim, dtype=K.dtype)
     grad_V = np.zeros(total_padded_kv_seq * head_num * head_dim, dtype=V.dtype)
     
@@ -162,9 +162,9 @@ def attn_backward(Q, K, V, grad_O, attn_weights, dropout_mask, dropout_p,
         kv_seq = cu_seqlens_kv[b + 1] - cu_seqlens_kv[b]
         
         for h in range(head_num):
-            # Calculate offsets
-            offset_Q = (b * head_num + h) * q_seq * head_dim
-            offset_grad_O = (b * head_num + h) * q_seq * head_dim
+            # Calculate offsets for [batch, q_seq, head_num, head_dim] layout
+            offset_Q = (b * q_seq * head_num + h) * head_dim
+            offset_grad_O = (b * q_seq * head_num + h) * head_dim
             offset_attn = (b * head_num + h) * q_seq * max_kv_seq
             offset_dropout = (b * head_num + h) * q_seq * max_kv_seq if dropout_mask is not None else 0
             
@@ -307,16 +307,14 @@ def test_mha_backward_vs_pytorch():
     )
     
     # Backward pass
-    # IMPORTANT: attn_backward expects Q and grad_O in [batch, head_num, q_seq, head_dim] layout
-    # But forward uses [batch, q_seq, head_num, head_dim], so we need to transpose
-    Q_transposed = Q_np.transpose(0, 2, 1, 3)  # [batch, head_num, q_seq, head_dim]
-    grad_O_transposed = grad_O_np.transpose(0, 2, 1, 3)  # [batch, head_num, q_seq, head_dim]
-    # attn_weights is already [batch, head_num, q_seq, max_kv_seq] from forward
+    # Q and grad_O are in [batch, q_seq, head_num, head_dim] layout (q_seq=1)
+    # attn_weights is [batch, head_num, q_seq, max_kv_seq] from forward
+    # No transpose needed as attn_backward expects [batch, q_seq, head_num, head_dim]
     
-    Q_flat = Q_transposed.reshape(-1)
+    Q_flat = Q_np.reshape(-1)
     K_flat = K_np.reshape(-1)
     V_flat = V_np.reshape(-1)
-    grad_O_flat = grad_O_transposed.reshape(-1)
+    grad_O_flat = grad_O_np.reshape(-1)
     attn_weights_flat = attn_weights.reshape(-1)
     
     grad_Q_flat, grad_K_flat, grad_V_flat = attn_backward(
@@ -335,8 +333,8 @@ def test_mha_backward_vs_pytorch():
         total_padded_kv_seq=total_padded_kv_seq
     )
     
-    # Reshape and transpose back to [batch, q_seq, head_num, head_dim]
-    grad_Q_custom = grad_Q_flat.reshape(batch, head_num, q_seq, head_dim).transpose(0, 2, 1, 3)
+    # Reshape to original layout [batch, q_seq, head_num, head_dim]
+    grad_Q_custom = grad_Q_flat.reshape(batch, q_seq, head_num, head_dim)
     grad_K_custom = grad_K_flat.reshape(batch, max_kv_seq, head_num, head_dim)
     grad_V_custom = grad_V_flat.reshape(batch, max_kv_seq, head_num, head_dim)
     
