@@ -385,10 +385,10 @@ struct AttnForwardKernelLauncher
 {
     static size_t calc_workspace_size()
     {
-        constexpr int bs            = Config::bs;
-        constexpr int head_num      = Config::head_num;
-        constexpr int seq_q         = Config::seq_q;
-        constexpr int max_seq_kv    = Config::max_seq_kv;
+        constexpr int bs         = Config::bs;
+        constexpr int head_num   = Config::head_num;
+        constexpr int seq_q      = Config::seq_q;
+        constexpr int max_seq_kv = Config::max_seq_kv;
 
         size_t workspace_size = bs * head_num * seq_q * max_seq_kv * sizeof(T);
         return workspace_size;
@@ -405,12 +405,12 @@ struct AttnForwardKernelLauncher
                                     const int* cu_seqlens_kv,
                                     const int* cu_seqlens_kv_padded)
     {
-        constexpr int bs            = Config::bs;
-        constexpr int head_num      = Config::head_num;
-        constexpr int seq_q         = Config::seq_q;
-        constexpr int max_seq_kv    = Config::max_seq_kv;
-        constexpr int head_dim      = Config::head_dim;
-        constexpr int warp_size     = 64;
+        constexpr int bs         = Config::bs;
+        constexpr int head_num   = Config::head_num;
+        constexpr int seq_q      = Config::seq_q;
+        constexpr int max_seq_kv = Config::max_seq_kv;
+        constexpr int head_dim   = Config::head_dim;
+        constexpr int warp_size  = 64;
 
         constexpr int merge_bs = bs * head_num;
         float scale            = sqr_dk_scale;
@@ -945,17 +945,15 @@ int main(int argc, char const* argv[])
     // Template parameters: DataType, BS, HEAD_NUM, SEQ_Q, HEAD_DIM, STEP2_BLOCK_SIZE,
     // ENABLE_DROPOUT_MASK, MASK_TYPE
 
-    // Quick correctness test with small batch size
-    // std::cout << "\n========== Correctness Test ==========" << std::endl;
-    // TestRunner<2, 16>::run<float, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
-    //     0, // dropout_p
-    //     1, // warmup_iters
-    //     1, // test_iters
-    //     1, // check_correctness - ENABLED
-    //     1  // dump_err
-    // );
+    std::cout << "\n========== Correctness Test ==========" << std::endl;
+    TestRunner<2, 16>::run<float, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
+        0, // dropout_p
+        1, // warmup_iters
+        1, // test_iters
+        1, // check_correctness - ENABLED
+        1  // dump_err
+    );
 
-    // Performance test with large batch size
     std::cout << "\n========== Performance Test ==========" << std::endl;
     TestRunner<2, 16>::run<hip_bfloat16, 30720, 32, 1, 128, 256, false, CausalMaskType::DISABLE>(
         0, // dropout_p

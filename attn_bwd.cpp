@@ -1249,27 +1249,26 @@ struct TestRunner<MAX_SEQ_KV, MAX_SEQ_KV>
 
 int main(int argc, char const* argv[])
 {
-    std::cout << "\n========== Testing with Small Batch ==========" << std::endl;
+    std::cout << "\n========== correctness test ==========" << std::endl;
 
-    using SmallConfig =
-        FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::DISABLE>;
-    test_run_attn_bwd_kernel<float, SmallConfig>(0,    // dropout_p
-                                                 10,   // warmup_iters
-                                                 10,   // test_iters
-                                                 true, // check_correctness
-                                                 true  // dump_err
+    using CorrConfig = FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::DISABLE>;
+    test_run_attn_bwd_kernel<float, CorrConfig>(0,    // dropout_p
+                                                10,   // warmup_iters
+                                                10,   // test_iters
+                                                true, // check_correctness
+                                                true  // dump_err
     );
 
-    // std::cout << "\n========== Testing with Large Batch ==========" << std::endl;
+    std::cout << "\n========== performance test ==========" << std::endl;
 
-    // using PerfConfig =
-    //     FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::TOP_LEFT>;
-    // test_run_attn_bwd_kernel<hip_bfloat16, PerfConfig>(0,     // dropout_p
-    //                                                    3,    // warmup_iters
-    //                                                    5,   // test_iters
-    //                                                    false, // check_correctness
-    //                                                    false  // dump_err
-    // );
+    using PerfConfig =
+        FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::TOP_LEFT>;
+    test_run_attn_bwd_kernel<hip_bfloat16, PerfConfig>(0,     // dropout_p
+                                                       3,     // warmup_iters
+                                                       5,     // test_iters
+                                                       false, // check_correctness
+                                                       false  // dump_err
+    );
 
     return 0;
 }
