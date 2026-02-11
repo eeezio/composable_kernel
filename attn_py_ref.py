@@ -250,13 +250,13 @@ def test_mha_backward_vs_pytorch():
         return
     
     # Test parameters
-    batch = 2
-    head_num = 4
+    batch = 256
+    head_num = 8
     q_seq = 1
-    max_kv_seq = 8  # For simplicity, kv_seq = max_kv_seq
-    head_dim = 64
+    max_kv_seq = 16  # For simplicity, kv_seq = max_kv_seq
+    head_dim = 128
     dropout_p = 0.0  # No dropout for easier comparison
-    mask_type = CausalMaskType.DISABLE  # No causal mask
+    mask_type = CausalMaskType.TOP_LEFT  # causal mask
     
     # Set random seed for reproducibility
     np.random.seed(42)
@@ -350,12 +350,32 @@ def test_mha_backward_vs_pytorch():
     K_pt = K_torch.permute(0, 2, 1, 3)  # [batch, head_num, max_kv_seq, head_dim]
     V_pt = V_torch.permute(0, 2, 1, 3)  # [batch, head_num, max_kv_seq, head_dim]
     
+    # Create attention mask based on mask_type
+    attn_mask_pt = None
+    is_causal = False
+    
+    if mask_type == CausalMaskType.TOP_LEFT:
+        # expects float mask with -inf for masked positions, or bool mask
+        attn_mask_pt = torch.zeros(q_seq, max_kv_seq, dtype=torch.float32)
+        for i in range(q_seq):
+            for j in range(max_kv_seq):
+                if j > i:
+                    attn_mask_pt[i, j] = float('-inf')
+                    
+    elif mask_type == CausalMaskType.BOTTOM_RIGHT:
+        # Bottom-right causal mask: mask positions where j < i
+        attn_mask_pt = torch.zeros(q_seq, max_kv_seq, dtype=torch.float32)
+        for i in range(q_seq):
+            for j in range(max_kv_seq):
+                if j < i:
+                    attn_mask_pt[i, j] = float('-inf')
+    
     # Compute attention
     O_pytorch = F.scaled_dot_product_attention(
         Q_pt, K_pt, V_pt,
-        attn_mask=None,
+        attn_mask=attn_mask_pt,
         dropout_p=dropout_p,
-        is_causal=False
+        is_causal=is_causal
     )
     
     # Backward pass
