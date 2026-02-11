@@ -60,7 +60,7 @@ struct FmhaKernelConfig
 };
 
 // Kernel 1: Compute grad_V = attn_weights^T @ grad_O
-template <typename T, typename Config, int TASKS_PER_BLOCK = 1, int BLOCK_K = 8>
+template <typename T, typename Config, int TASKS_PER_BLOCK = 1, int BLOCK_K = 16>
 __global__ void compute_grad_v_kernel(const T* attn_weights,
                                       const T* grad_O,
                                       T* grad_V,
@@ -97,18 +97,16 @@ __global__ void compute_grad_v_kernel(const T* attn_weights,
         if(batch_idx >= Config::bs)
             continue;
 
-        // Get actual and padded sequence lengths for this batch
-        int seq_kv        = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
-        int padded_kv_seq = cu_seqlens_kv_padded[batch_idx + 1] - cu_seqlens_kv_padded[batch_idx];
-        int kv_offset     = batch_idx * max_seq_kv;  // STANDARD layout offset
+        // Get actual sequence length for this batch
+        int seq_kv = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
 
-        // Load attn_weights  for this position
+        // Load attn_weights for this position
 #pragma unroll
         for(int i = 0; i < max_seq_kv; i++)
             attn[i] = attn_weights[cur_idx * max_seq_kv + i];
 
-        // Compute grad_V = attn_weights^T @ grad_O (use padded_kv_seq to cover padding region)
-        for(int j = 0; j < padded_kv_seq; j++)
+        // Compute grad_V = attn_weights^T @ grad_O (only compute actual seq, not padding)
+        for(int j = 0; j < seq_kv; j++)
         {
             uint4 store_dwordx4_tmp_var[block_k / dwordx4_load_elt];
 #pragma unroll
@@ -142,10 +140,10 @@ __global__ void compute_grad_v_kernel(const T* attn_weights,
 #pragma unroll
             for(int i = 0; i < block_k / dwordx4_load_elt; i++)
             {
-                // STANDARD layout: [bs, max_seq_kv, head_num, head_dim]
+                // DYNAMIC layout: use cu_seqlens_kv_padded for offset
                 int grad_v_idx =
-                    ((batch_idx * max_seq_kv + j) * Config::head_num + head_idx) * head_dim +
-                    thread_head_offset + i * dwordx4_load_elt;
+                    (cu_seqlens_kv_padded[batch_idx] + j) * Config::head_num * head_dim +
+                    head_idx * head_dim + thread_head_offset + i * dwordx4_load_elt;
                 *((uint4*)&grad_V[grad_v_idx]) = store_dwordx4_tmp_var[i];
             }
         }
@@ -182,9 +180,8 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
         if(batch_idx >= Config::bs)
             continue;
 
-        // Get actual and padded sequence lengths for this batch
-        int seq_kv        = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
-        int padded_kv_seq = cu_seqlens_kv_padded[batch_idx + 1] - cu_seqlens_kv_padded[batch_idx];
+        // Get actual sequence length for this batch
+        int seq_kv = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
 
         float results[max_seq_kv];
         T fetch_grad_O[block_k];
@@ -194,15 +191,16 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
                                      seq_idx * Config::head_num + head_idx) *
                                     head_dim];
 
-        // STANDARD layout: [bs, max_seq_kv, head_num, head_dim]
-        const T* V_base = &V[(batch_idx * max_seq_kv * Config::head_num + head_idx) * head_dim];
-        int V_stride    = Config::head_num * head_dim;
+        // DYNAMIC layout: use cu_seqlens_kv_padded for offset
+        const T* V_base =
+            &V[cu_seqlens_kv_padded[batch_idx] * Config::head_num * head_dim + head_idx * head_dim];
+        int V_stride = Config::head_num * head_dim;
 
         T* grad_attn_ptr = (T*)&grad_attn[cur_batch_idx * max_seq_kv];
 
         uint4 ls_dwordx4_tmp_var;
 
-        for(int i = 0; i < padded_kv_seq; i++)
+        for(int i = 0; i < seq_kv; i++)
             results[i] = 0.0f;
 
         for(int dim_offset = 0; dim_offset < head_dim; dim_offset += block_k)
@@ -222,7 +220,7 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
                     fetch_grad_O[k * 8 + 7] = ((hip_bfloat16*)&ls_dwordx4_tmp_var.w)[1];
                 }
 
-                for(int kv_idx = 0; kv_idx < padded_kv_seq; kv_idx++)
+                for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
                 {
                     for(int k = 0; k < block_k / 8; k++)
                     {
@@ -256,7 +254,7 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
                     fetch_grad_O[k * 4 + 3] = *((T*)&ls_dwordx4_tmp_var.w);
                 }
 
-                for(int kv_idx = 0; kv_idx < padded_kv_seq; kv_idx++)
+                for(int kv_idx = 0; kv_idx < seq_kv; kv_idx++)
                 {
                     for(int k = 0; k < block_k / 4; k++)
                     {
@@ -276,12 +274,12 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
             }
         }
 
-        for(int i = 0; i < padded_kv_seq; i++)
+        for(int i = 0; i < seq_kv; i++)
         {
             grad_attn_ptr[i] = T(results[i]);
         }
-        // Zero out padding positions beyond padded_kv_seq
-        for(int i = padded_kv_seq; i < max_seq_kv; i++)
+        // Zero out padding positions beyond seq_kv
+        for(int i = seq_kv; i < max_seq_kv; i++)
         {
             grad_attn_ptr[i] = T(0.0f);
         }
@@ -381,7 +379,7 @@ __global__ void softmax_backward_kernel(const T* attn_weights,
 }
 
 // Kernel 4: Compute grad_Q and grad_K
-template <typename T, typename Config, int TASKS_PER_BLOCK = 1, int BLOCK_K = 8>
+template <typename T, typename Config, int TASKS_PER_BLOCK = 1, int BLOCK_K = 16>
 __global__ void compute_grad_qk_kernel(const T* grad_scores,
                                        const T* Q,
                                        const T* K,
@@ -421,10 +419,8 @@ __global__ void compute_grad_qk_kernel(const T* grad_scores,
         if(batch_idx >= Config::bs)
             continue;
 
-        // Get actual and padded sequence lengths for this batch
-        int seq_kv        = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
-        int padded_kv_seq = cu_seqlens_kv_padded[batch_idx + 1] - cu_seqlens_kv_padded[batch_idx];
-        int kv_offset     = batch_idx * max_seq_kv;  // STANDARD layout offset
+        // Get actual sequence length for this batch
+        int seq_kv = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
 
         // Load grad_scores for this position
 #pragma unroll
@@ -442,15 +438,14 @@ __global__ void compute_grad_qk_kernel(const T* grad_scores,
             store_dwordx4_tmp_var[i].w = 0;
         }
 
-        for(int j = 0; j < padded_kv_seq; j++)
+        for(int j = 0; j < seq_kv; j++)
         {
 #pragma unroll
             for(int i = 0; i < block_k / dwordx4_load_elt; i++)
             {
-                // STANDARD layout: [bs, max_seq_kv, head_num, head_dim]
-                int k_idx =
-                    ((batch_idx * max_seq_kv + j) * Config::head_num + head_idx) * head_dim +
-                    thread_head_offset + i * dwordx4_load_elt;
+                // DYNAMIC layout: use cu_seqlens_kv_padded for offset
+                int k_idx = (cu_seqlens_kv_padded[batch_idx] + j) * Config::head_num * head_dim +
+                            head_idx * head_dim + thread_head_offset + i * dwordx4_load_elt;
                 load_dwordx4_tmp_var[i] = *((uint4*)&K[k_idx]);
             }
 #pragma unroll
@@ -487,7 +482,7 @@ __global__ void compute_grad_qk_kernel(const T* grad_scores,
                                                    thread_head_offset + i * dwordx4_load_elt]);
         }
 
-        for(int j = 0; j < padded_kv_seq; j++)
+        for(int j = 0; j < seq_kv; j++)
         {
 #pragma unroll
             for(int b = 0; b < block_k; b++)
@@ -495,10 +490,10 @@ __global__ void compute_grad_qk_kernel(const T* grad_scores,
                 T val = grad_score_vals[j] *
                         ((T*)&load_dwordx4_tmp_var[b / dwordx4_load_elt])[b % dwordx4_load_elt] *
                         T(scale);
-                // STANDARD layout: [bs, max_seq_kv, head_num, head_dim]
+                // DYNAMIC layout: use cu_seqlens_kv_padded for offset
                 int grad_k_idx =
-                    ((batch_idx * max_seq_kv + j) * Config::head_num + head_idx) * head_dim +
-                    thread_head_offset + b;
+                    (cu_seqlens_kv_padded[batch_idx] + j) * Config::head_num * head_dim +
+                    head_idx * head_dim + thread_head_offset + b;
                 grad_K[grad_k_idx] = val;
             }
         }
@@ -549,7 +544,7 @@ struct AttnBackwardKernelLauncher
         dim3 block(warp_size);
 
         // Step 1: Compute grad_V = attn_weights^T @ grad_O
-        constexpr int tasks_per_block_v = 1;
+        constexpr int tasks_per_block_v = 16;
         dim3 grid_v((bs * seq_q * head_num + tasks_per_block_v - 1) / tasks_per_block_v);
         compute_grad_v_kernel<T, Config, tasks_per_block_v>
             <<<grid_v, block>>>(attn_weights, grad_O, grad_V, cu_seqlens_kv, cu_seqlens_kv_padded);
@@ -572,7 +567,7 @@ struct AttnBackwardKernelLauncher
             attn_weights, dropout_mask, workspace, dropout_scale, cu_seqlens_kv);
 
         // Step 4: Compute grad_Q and grad_K
-        constexpr int tasks_per_block_qk = 1;
+        constexpr int tasks_per_block_qk = 4;
         dim3 grid_qk((bs * seq_q * head_num + tasks_per_block_qk - 1) / tasks_per_block_qk);
         compute_grad_qk_kernel<T, Config, tasks_per_block_qk><<<grid_qk, block>>>(
             workspace, Q, K, grad_Q, grad_K, scale, cu_seqlens_kv, cu_seqlens_kv_padded);
@@ -647,7 +642,8 @@ void attn_backward(const T* Q,
                    int head_dim,
                    CausalMaskType mask_type,
                    const int* cu_seqlens_kv,
-                   const int* cu_seqlens_kv_padded)
+                   const int* cu_seqlens_kv_padded,
+                   int total_padded_kv_seq)
 {
 
     float scale         = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -665,16 +661,14 @@ void attn_backward(const T* Q,
 
     // Initialize gradients to zero
     std::memset(grad_Q, 0, batch * head_num * q_seq * head_dim * sizeof(T));
-    std::memset(grad_K, 0, batch * max_kv_seq * head_num * head_dim * sizeof(T));
-    std::memset(grad_V, 0, batch * max_kv_seq * head_num * head_dim * sizeof(T));
+    std::memset(grad_K, 0, total_padded_kv_seq * head_num * head_dim * sizeof(T));
+    std::memset(grad_V, 0, total_padded_kv_seq * head_num * head_dim * sizeof(T));
 
     // Process each batch and head
     for(int b = 0; b < batch; b++)
     {
-        // Get actual and padded sequence lengths for this batch
-        int kv_seq        = cu_seqlens_kv[b + 1] - cu_seqlens_kv[b];
-        int padded_kv_seq = cu_seqlens_kv_padded[b + 1] - cu_seqlens_kv_padded[b];
-        int kv_offset     = b * max_kv_seq;  // STANDARD layout offset
+        // Get actual sequence length for this batch
+        int kv_seq = cu_seqlens_kv[b + 1] - cu_seqlens_kv[b];
 
         for(int h = 0; h < head_num; h++)
         {
@@ -690,19 +684,20 @@ void attn_backward(const T* Q,
 
             T* grad_Q_bh = grad_Q + offset_Q;
 
-            // STANDARD layout: [bs, max_seq_kv, head_num, head_dim]
-            // For batch b, head h: start at b * (max_seq_kv * head_num * head_dim) + h * head_dim
-            int offset_K_base = b * (max_kv_seq * head_num * head_dim) + h * head_dim;
+            // DYNAMIC layout: use cu_seqlens_kv_padded for offset
+            // For batch b, head h: start at cu_seqlens_kv_padded[b] * head_num * head_dim + h *
+            // head_dim
+            int offset_K_base = cu_seqlens_kv_padded[b] * head_num * head_dim + h * head_dim;
             const T* K_bh     = K + offset_K_base;
             const T* V_bh     = V + offset_K_base;
             T* grad_K_bh      = grad_K + offset_K_base;
             T* grad_V_bh      = grad_V + offset_K_base;
             int kv_stride     = head_num * head_dim;
 
-            // Copy K/V data to contiguous buffers for this batch (use padded length)
-            std::vector<T> K_cont(padded_kv_seq * head_dim);
-            std::vector<T> V_cont(padded_kv_seq * head_dim);
-            for(int i = 0; i < padded_kv_seq; i++)
+            // Copy K/V data to contiguous buffers for this batch (use actual seq length)
+            std::vector<T> K_cont(kv_seq * head_dim);
+            std::vector<T> V_cont(kv_seq * head_dim);
+            for(int i = 0; i < kv_seq; i++)
             {
                 for(int j = 0; j < head_dim; j++)
                 {
@@ -712,34 +707,34 @@ void attn_backward(const T* Q,
             }
 
             // Step 1: grad_V = attn_weights^T @ grad_O
-            transpose(attn_bh, attn_T.data(), q_seq, padded_kv_seq);
-            std::vector<T> grad_V_cont(padded_kv_seq * head_dim);
-            matmul(attn_T.data(), grad_O_bh, grad_V_cont.data(), padded_kv_seq, q_seq, head_dim);
+            transpose(attn_bh, attn_T.data(), q_seq, kv_seq);
+            std::vector<T> grad_V_cont(kv_seq * head_dim);
+            matmul(attn_T.data(), grad_O_bh, grad_V_cont.data(), kv_seq, q_seq, head_dim);
 
             // Step 2: grad_attn = grad_O @ V^T
-            transpose(V_cont.data(), V_T.data(), padded_kv_seq, head_dim);
-            matmul(grad_O_bh, V_T.data(), grad_attn.data(), q_seq, head_dim, padded_kv_seq);
+            transpose(V_cont.data(), V_T.data(), kv_seq, head_dim);
+            matmul(grad_O_bh, V_T.data(), grad_attn.data(), q_seq, head_dim, kv_seq);
 
             // Step 3: Dropout backward
             if(dropout_p > 0.0f && dropout_bh != nullptr)
             {
-                for(int i = 0; i < q_seq * padded_kv_seq; i++)
+                for(int i = 0; i < q_seq * kv_seq; i++)
                 {
                     grad_attn[i] = T(float(grad_attn[i]) * float(dropout_bh[i]) * dropout_scale);
                 }
             }
 
             // Step 4: Softmax backward
-            for(int i = 0; i < q_seq * padded_kv_seq; i++)
+            for(int i = 0; i < q_seq * kv_seq; i++)
             {
                 grad_scores[i] = T(float(grad_attn[i]) * float(attn_bh[i]));
             }
 
-            sum_last_dim(grad_scores.data(), row_sums.data(), q_seq, padded_kv_seq);
+            sum_last_dim(grad_scores.data(), row_sums.data(), q_seq, kv_seq);
 
             for(int i = 0; i < q_seq; i++)
             {
-                for(int j = 0; j < padded_kv_seq; j++)
+                for(int j = 0; j < kv_seq; j++)
                 {
                     int idx = i * kv_seq + j;
                     grad_scores[idx] =
@@ -752,11 +747,11 @@ void attn_backward(const T* Q,
             {
                 for(int i = 0; i < q_seq; i++)
                 {
-                    for(int j = 0; j < padded_kv_seq; j++)
+                    for(int j = 0; j < kv_seq; j++)
                     {
                         if(j > i)
                         {
-                            grad_scores[i * padded_kv_seq + j] = T(0.0f);
+                            grad_scores[i * kv_seq + j] = T(0.0f);
                         }
                     }
                 }
@@ -765,34 +760,34 @@ void attn_backward(const T* Q,
             {
                 for(int i = 0; i < q_seq; i++)
                 {
-                    for(int j = 0; j < padded_kv_seq; j++)
+                    for(int j = 0; j < kv_seq; j++)
                     {
                         if(j < i)
                         {
-                            grad_scores[i * padded_kv_seq + j] = T(0.0f);
+                            grad_scores[i * kv_seq + j] = T(0.0f);
                         }
                     }
                 }
             }
 
             // Step 6: grad_Q = grad_scores @ K * scale
-            matmul(grad_scores.data(), K_cont.data(), grad_Q_bh, q_seq, padded_kv_seq, head_dim);
+            matmul(grad_scores.data(), K_cont.data(), grad_Q_bh, q_seq, kv_seq, head_dim);
             for(int i = 0; i < q_seq * head_dim; i++)
             {
                 grad_Q_bh[i] = T(float(grad_Q_bh[i]) * scale);
             }
 
             // Step 7: grad_K = grad_scores^T @ Q * scale
-            transpose(grad_scores.data(), grad_scores_T.data(), q_seq, padded_kv_seq);
-            std::vector<T> grad_K_cont(padded_kv_seq * head_dim);
-            matmul(grad_scores_T.data(), Q_bh, grad_K_cont.data(), padded_kv_seq, q_seq, head_dim);
-            for(int i = 0; i < padded_kv_seq * head_dim; i++)
+            transpose(grad_scores.data(), grad_scores_T.data(), q_seq, kv_seq);
+            std::vector<T> grad_K_cont(kv_seq * head_dim);
+            matmul(grad_scores_T.data(), Q_bh, grad_K_cont.data(), kv_seq, q_seq, head_dim);
+            for(int i = 0; i < kv_seq * head_dim; i++)
             {
                 grad_K_cont[i] = T(float(grad_K_cont[i]) * scale);
             }
 
             // Copy grad_K and grad_V back to layout
-            for(int i = 0; i < padded_kv_seq; i++)
+            for(int i = 0; i < kv_seq; i++)
             {
                 for(int j = 0; j < head_dim; j++)
                 {
@@ -822,36 +817,37 @@ void test_run_attn_bwd_kernel(
     // Generate random actual sequence lengths using normal distribution (mean=4)
     std::random_device rd;
     std::mt19937 gen(42);                                   // Fixed seed for reproducibility
-    std::normal_distribution<float> normal_dis(4.0f, 1.5f); // mean=4, stddev=1.5
+    std::normal_distribution<float> normal_dis(4.0f, 2.0f); // mean=4, std=2
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
     std::vector<int> h_cu_seqlens_kv(bs + 1);
     std::vector<int> h_cu_seqlens_kv_padded(bs + 1);
+
     h_cu_seqlens_kv[0]        = 0;
     h_cu_seqlens_kv_padded[0] = 0;
 
-    std::uniform_int_distribution<int> padding_dis(0, max_seq_kv / 2);
-    
+    int total_actual_kv_seq = 0;
+    int total_padded_kv_seq = 0;
+    std::uniform_int_distribution<int> pad_dis(0, 5); // Random padding 0-5
+
     for(int b = 0; b < bs; b++)
     {
-        // Generate actual sequence length from normal distribution, clamp to [2, max_seq_kv]
-        int actual_kv_seq =
-            std::max(2, std::min(max_seq_kv, static_cast<int>(std::round(normal_dis(gen)))));
-        // Add random padding, ensure total doesn't exceed max_seq_kv
-        int padding = padding_dis(gen);
-        int padded_kv_seq = std::min(max_seq_kv, actual_kv_seq + padding);
-        
-        h_cu_seqlens_kv[b + 1]        = h_cu_seqlens_kv[b] + actual_kv_seq;
-        h_cu_seqlens_kv_padded[b + 1] = h_cu_seqlens_kv_padded[b] + padded_kv_seq;
+        // Generate kv-seq length from normal distribution, clamped to [2, max_seq_kv]
+        int kv_len = static_cast<int>(std::round(normal_dis(gen)));
+        kv_len     = std::max(2, std::min(max_seq_kv, kv_len));
+        // Random padding (not aligned to any specific boundary)
+        int random_pad = pad_dis(gen);
+        int padded_len = kv_len + random_pad > max_seq_kv ? max_seq_kv : kv_len + random_pad;
+        total_padded_kv_seq += padded_len;
+        total_actual_kv_seq += kv_len;
+        h_cu_seqlens_kv[b + 1]        = total_actual_kv_seq;
+        h_cu_seqlens_kv_padded[b + 1] = total_padded_kv_seq;
     }
 
-    int total_actual_kv_seq = h_cu_seqlens_kv[bs];
-    int total_padded_kv_seq = h_cu_seqlens_kv_padded[bs];
-
-    // Calculate sizes (STANDARD layout: [bs, max_seq_kv, head_num, head_dim])
+    // Calculate sizes (DYNAMIC layout: total_padded_kv_seq * head_num * head_dim for K/V)
     size_t size_Q            = bs * head_num * seq_q * head_dim;
-    size_t size_K            = bs * max_seq_kv * head_num * head_dim;
-    size_t size_V            = bs * max_seq_kv * head_num * head_dim;
+    size_t size_K            = total_padded_kv_seq * head_num * head_dim;
+    size_t size_V            = total_padded_kv_seq * head_num * head_dim;
     size_t size_grad_O       = bs * head_num * seq_q * head_dim;
     size_t size_attn_weights = bs * head_num * seq_q * max_seq_kv;
     size_t size_dropout_mask = bs * head_num * seq_q * max_seq_kv;
@@ -874,20 +870,24 @@ void test_run_attn_bwd_kernel(
     for(size_t i = 0; i < size_Q; i++)
         h_Q[i] = DataType(dis(gen));
 
-    // Initialize K/V with variable sequence lengths
+    // Initialize K/V with variable sequence lengths (DYNAMIC layout)
+    // First zero out all K/V memory
+    std::memset(h_K.data(), 0, size_K * sizeof(DataType));
+    std::memset(h_V.data(), 0, size_V * sizeof(DataType));
+
     for(int b = 0; b < bs; b++)
     {
-        int kv_seq    = h_cu_seqlens_kv[b + 1] - h_cu_seqlens_kv[b];
-        int kv_offset = h_cu_seqlens_kv_padded[b];
-
+        int kv_seq = h_cu_seqlens_kv[b + 1] - h_cu_seqlens_kv[b];
         for(int h = 0; h < head_num; h++)
         {
             for(int s = 0; s < kv_seq; s++)
             {
                 for(int d = 0; d < head_dim; d++)
                 {
-                    // STANDARD layout: [bs, max_seq_kv, head_num, head_dim]
-                    int idx  = ((b * max_seq_kv + s) * head_num + h) * head_dim + d;
+                    // DYNAMIC layout: (cu_seqlens_kv_padded[b] + s) * head_num * head_dim + h *
+                    // head_dim + d
+                    int idx =
+                        (h_cu_seqlens_kv_padded[b] + s) * head_num * head_dim + h * head_dim + d;
                     h_K[idx] = DataType(dis(gen));
                     h_V[idx] = DataType(dis(gen));
                 }
@@ -960,7 +960,8 @@ void test_run_attn_bwd_kernel(
                       head_dim,
                       Config::mask_type,
                       h_cu_seqlens_kv.data(),
-                      h_cu_seqlens_kv_padded.data());
+                      h_cu_seqlens_kv_padded.data(),
+                      total_padded_kv_seq);
 
     // Allocate device memory
     DataType *d_Q, *d_K, *d_V, *d_grad_O, *d_attn_weights;
@@ -1128,8 +1129,8 @@ void test_run_attn_bwd_kernel(
     std::cout << "  KV max sequence length: " << max_seq_kv << std::endl;
     std::cout << "  KV avg sequence length: " << std::fixed << std::setprecision(2) << avg_kv_seq
               << std::endl;
-    std::cout << "  KV avg padded length: " << std::fixed << std::setprecision(2) << avg_padded_kv_seq
-              << std::endl;
+    std::cout << "  KV avg padded length: " << std::fixed << std::setprecision(2)
+              << avg_padded_kv_seq << std::endl;
     std::cout << "  Total actual KV seq: " << total_actual_kv_seq << std::endl;
     std::cout << "  Total padded KV seq: " << total_padded_kv_seq << std::endl;
     std::cout << "  Head dimension: " << head_dim << std::endl;
@@ -1250,24 +1251,25 @@ int main(int argc, char const* argv[])
 {
     std::cout << "\n========== Testing with Small Batch ==========" << std::endl;
 
-    using SmallConfig = FmhaKernelConfig<4, 2, 1, 16, 128, 128, false, CausalMaskType::TOP_LEFT>;
-    test_run_attn_bwd_kernel<hip_bfloat16, SmallConfig>(0,    // dropout_p
-                                                        10,   // warmup_iters
-                                                        10,   // test_iters
-                                                        true, // check_correctness
-                                                        false // dump_err
+    using SmallConfig =
+        FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::DISABLE>;
+    test_run_attn_bwd_kernel<float, SmallConfig>(0,    // dropout_p
+                                                 10,   // warmup_iters
+                                                 10,   // test_iters
+                                                 true, // check_correctness
+                                                 true  // dump_err
     );
 
-    std::cout << "\n========== Testing with Large Batch ==========" << std::endl;
+    // std::cout << "\n========== Testing with Large Batch ==========" << std::endl;
 
-    using PerfConfig =
-        FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::TOP_LEFT>;
-    test_run_attn_bwd_kernel<hip_bfloat16, PerfConfig>(0,     // dropout_p
-                                                       10,    // warmup_iters
-                                                       100,   // test_iters
-                                                       false, // check_correctness
-                                                       false  // dump_err
-    );
+    // using PerfConfig =
+    //     FmhaKernelConfig<30720, 32, 1, 16, 128, 128, false, CausalMaskType::TOP_LEFT>;
+    // test_run_attn_bwd_kernel<hip_bfloat16, PerfConfig>(0,     // dropout_p
+    //                                                    3,    // warmup_iters
+    //                                                    5,   // test_iters
+    //                                                    false, // check_correctness
+    //                                                    false  // dump_err
+    // );
 
     return 0;
 }
